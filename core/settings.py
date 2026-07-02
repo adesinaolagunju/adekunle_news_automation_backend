@@ -1,0 +1,175 @@
+# core/settings.py
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+import dj_database_url
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-your-secret-key-here')
+DEBUG = os.getenv('DEBUG', 'True') == 'True'
+ALLOWED_HOSTS = ['*']
+
+# Application definition
+INSTALLED_APPS = [
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
+    
+    # Third party
+    'rest_framework',
+    'corsheaders',
+    'django_celery_beat',
+    'drf_spectacular',
+    
+    # Local
+    'news',
+    'social',
+    'posts',
+    'accounts',
+    'api',
+]
+
+MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+ROOT_URLCONF = 'core.urls'
+
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [BASE_DIR / 'templates'],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.debug',
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = 'core.wsgi.application'
+
+# Database
+DATABASES = {
+    "default": dj_database_url.config(
+        # First, check if DATABASE_URL is set in environment (e.g., from Docker)
+        env="DATABASE_URL",
+        default="postgresql://adekunle:gOEgNARWMelB51tgX6D3t71TJUhmVkq0@dpg-d9304l6rnols7381mh00-a.oregon-postgres.render.com/adekunle",
+        conn_max_age=600,
+        ssl_require=True,
+    )
+}
+
+# Redis & Celery
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
+CELERY_ACCEPT_CONTENT = ['application/json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# CORS
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = True
+
+# REST Framework
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+# Static & Media
+STATIC_URL = 'static/'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+MEDIA_URL = 'media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+
+
+# Swagger/OpenAPI settings
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Adekunle News Automation API',
+    'DESCRIPTION': '''
+    ## Adekunle News Automation Platform
+    
+    This API powers the Adekunle News Automation system, allowing you to:
+    
+    ### Core Features
+    - **News Management**: Fetch, filter, and manage news articles
+    - **Social Media Integration**: Post to Telegram, X, Facebook, Instagram
+    - **Automation**: Schedule and queue posts automatically
+    - **Analytics**: Track posting history and performance
+    
+    ### Authentication
+    All endpoints require authentication. Use the `/api/auth/login/` endpoint to obtain a session cookie or use Token authentication.
+    
+    ### Rate Limiting
+    Rate limits apply to protect the system. Contact the admin for custom limits.
+    ''',
+    'VERSION': '1.0.0',
+    'CONTACT': {
+        'name': 'Adekunle News Team',
+        'email': 'support@adekunlereport.com',
+        'url': 'https://adekunlereport.com',
+    },
+    'LICENSE': {
+        'name': 'MIT License',
+        'url': 'https://opensource.org/licenses/MIT',
+    },
+    'SERVE_INCLUDE_SCHEMA': True,
+    'SWAGGER_UI_SETTINGS': {
+        'deepLinking': True,
+        'persistAuthorization': True,
+        'displayOperationId': True,
+        'filter': True,  # Enable search/filter in docs
+        'showExtensions': True,
+        'showCommonExtensions': True,
+        'tryItOutEnabled': True,
+    },
+    'TAGS': [
+        {'name': 'auth', 'description': 'Authentication endpoints'},
+        {'name': 'news', 'description': 'News management endpoints'},
+        {'name': 'categories', 'description': 'Category management'},
+        {'name': 'countries', 'description': 'Country management'},
+        {'name': 'filter-rules', 'description': 'News filter rules'},
+        {'name': 'telegram-channels', 'description': 'Telegram channel configuration'},
+        {'name': 'platforms', 'description': 'Social platform management'},
+        {'name': 'posts', 'description': 'Post jobs and history'},
+        {'name': 'stats', 'description': 'Dashboard statistics'},
+        {'name': 'settings', 'description': 'System settings'},
+    ],
+    'EXTENSIONS': {
+        'x-version': '1.0.0',
+        'x-organization': 'Adekunle News',
+    },
+}
