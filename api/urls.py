@@ -10,7 +10,7 @@ router.register(r'categories', CategoryViewSet, basename='categories')
 router.register(r'countries', CountryViewSet, basename='countries')
 router.register(r'filter-rules', FilterRuleViewSet, basename='filter-rules')
 router.register(r'telegram-channels', TelegramChannelViewSet, basename='telegram-channels')
-router.register(r'platforms', SocialPlatformViewSet, basename='platforms')
+router.register(r'platforms', SocialPlatformViewSet, basename='platforms')  # <-- Social platform CRUD
 router.register(r'posts', PostJobViewSet, basename='posts')
 
 urlpatterns = [
@@ -25,6 +25,12 @@ urlpatterns = [
     
     # Settings endpoints
     path('settings/', SystemSettingsView.as_view(), name='settings'),
+    
+    # Platform management endpoints
+    path('platforms/connect/', PlatformConnectionView.as_view(), name='platform-connect'),
+    path('platforms/connect/<str:platform_name>/', PlatformConnectionView.as_view(), name='platform-update'),
+    path('platforms/test/', PlatformTestView.as_view(), name='platform-test'),
+    path('platforms/bulk-config/', BulkPlatformConfigView.as_view(), name='platform-bulk-config'),
     
     # Include router URLs
     path('', include(router.urls)),
