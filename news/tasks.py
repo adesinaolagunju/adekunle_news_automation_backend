@@ -5,8 +5,7 @@ from django.db import transaction
 from .services import NewsFetcher
 from .models import News
 from posts.models import PostJob
-from social.models import SocialPlatform, TelegramChannel
-from social.telegram import TelegramService, TelegramPostFormatter
+from social.models import BufferAccount, SocialPlatform, TelegramChannel
 from posts.tasks import process_post_job
 
 @shared_task
@@ -34,9 +33,12 @@ def fetch_and_queue_news():
         if not fetcher.should_post_news(news):
             continue
         
-        # Get enabled platforms
-        platforms = SocialPlatform.objects.filter(enabled=True)
-        
+        # Get enabled supported platforms
+        platforms = SocialPlatform.objects.filter(
+            enabled=True,
+            name__in=['telegram', 'buffer']
+        )
+
         # Create post jobs
         for platform in platforms:
             # For Telegram, we need to specify channels
@@ -50,13 +52,18 @@ def fetch_and_queue_news():
                         status='pending'
                     )
                     queued_count += 1
-            else:
-                PostJob.objects.create(
-                    news=news,
-                    platform=platform,
-                    status='pending'
-                )
-                queued_count += 1
+            elif platform.name == 'buffer':
+                buffer_accounts = BufferAccount.objects.filter(
+                    connection_status='connected'
+                ).order_by('-updated_at')
+                for buffer_account in buffer_accounts:
+                    PostJob.objects.create(
+                        news=news,
+                        platform=platform,
+                        buffer_account=buffer_account,
+                        status='pending'
+                    )
+                    queued_count += 1
     
     print(f"Queued {queued_count} post jobs")
     

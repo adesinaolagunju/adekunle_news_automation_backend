@@ -12,10 +12,11 @@ from django_celery_beat.models import PeriodicTask, IntervalSchedule
 import json
 
 from news.models import News, Category, Country, NewsFilterRule
-from social.models import TelegramChannel, SocialPlatform
+from social.models import BufferAccount, TelegramChannel, SocialPlatform
 from posts.models import PostJob, PostLog
 from posts.tasks import process_post_job
 from news.tasks import fetch_and_queue_news
+from social.buffer import BufferAuthenticationError, BufferService, BufferServiceError
 from social.telegram import TelegramService
 
 from .serializers import *
@@ -67,6 +68,157 @@ class LogoutView(APIView):
 class UserView(APIView):
     def get(self, request):
         return Response(UserSerializer(request.user).data)
+
+
+# ============ BUFFER VIEWS ============
+
+class BufferAPIView(APIView):
+    """Base helpers for authenticated Buffer API views."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_buffer_account(self):
+        return BufferAccount.objects.filter(user=self.request.user).order_by('-created_at').first()
+
+    def buffer_error_response(self, error):
+        if isinstance(error, BufferAuthenticationError):
+            response_status = status.HTTP_401_UNAUTHORIZED
+        else:
+            response_status = status.HTTP_400_BAD_REQUEST
+
+        return Response({
+            'success': False,
+            'error': str(error)
+        }, status=response_status)
+
+
+class BufferConnectView(BufferAPIView):
+    @extend_schema(
+        summary="Connect Buffer",
+        description="Connect the authenticated user to Buffer using Buffer credentials.",
+        request=BufferConnectSerializer,
+        responses={200: BufferAccountStatusSerializer}
+    )
+    def post(self, request):
+        serializer = BufferConnectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        data = serializer.validated_data
+        service = BufferService(data['access_token'])
+
+        try:
+            service.test_connection()
+        except BufferServiceError as error:
+            return self.buffer_error_response(error)
+
+        account = self.get_buffer_account()
+        if account is None:
+            account = BufferAccount(user=request.user)
+
+        account.access_token = data['access_token']
+        account.refresh_token = data.get('refresh_token') or None
+        account.token_expires_at = data.get('token_expires_at')
+        account.connection_status = 'connected'
+        account.save()
+
+        return Response({
+            'success': True,
+            'account': BufferAccountStatusSerializer(account).data
+        })
+
+
+class BufferStatusView(BufferAPIView):
+    @extend_schema(
+        summary="Get Buffer status",
+        description="Return the authenticated user's Buffer connection status.",
+        responses={200: BufferAccountStatusSerializer}
+    )
+    def get(self, request):
+        account = self.get_buffer_account()
+        if account is None:
+            return Response({
+                'connected': False,
+                'connection_status': 'disconnected'
+            })
+
+        return Response(BufferAccountStatusSerializer(account).data)
+
+
+class BufferProfilesView(BufferAPIView):
+    @extend_schema(
+        summary="List Buffer profiles",
+        description="Fetch Buffer profiles available to the connected Buffer account.",
+        responses={200: BufferProfileSerializer(many=True)}
+    )
+    def get(self, request):
+        account = self.get_buffer_account()
+        if account is None or account.connection_status != 'connected':
+            return Response({
+                'error': 'Buffer is not connected'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        service = BufferService(account.access_token)
+
+        try:
+            profiles = service.get_profiles()
+        except BufferServiceError as error:
+            return self.buffer_error_response(error)
+
+        return Response({
+            'profiles': profiles
+        })
+
+
+class BufferDisconnectView(BufferAPIView):
+    @extend_schema(
+        summary="Disconnect Buffer",
+        description="Remove stored Buffer credentials for the authenticated user.",
+        responses={200: {'type': 'object'}}
+    )
+    def post(self, request):
+        deleted_count, _ = BufferAccount.objects.filter(user=request.user).delete()
+
+        return Response({
+            'success': True,
+            'connected': False,
+            'connection_status': 'disconnected',
+            'deleted_accounts': deleted_count
+        })
+
+
+class BufferTestView(BufferAPIView):
+    @extend_schema(
+        summary="Test Buffer connection",
+        description="Test a supplied Buffer access token or the authenticated user's stored Buffer token.",
+        request=BufferTestSerializer,
+        responses={200: {'type': 'object'}}
+    )
+    def post(self, request):
+        serializer = BufferTestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        access_token = serializer.validated_data.get('access_token')
+        if not access_token:
+            account = self.get_buffer_account()
+            if account is None:
+                return Response({
+                    'success': False,
+                    'error': 'Buffer is not connected and no access_token was provided'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            access_token = account.access_token
+
+        service = BufferService(access_token)
+
+        try:
+            user_info = service.test_connection()
+        except BufferServiceError as error:
+            return self.buffer_error_response(error)
+
+        return Response({
+            'success': True,
+            'message': 'Buffer connection successful',
+            'user': user_info
+        })
 
 
 # ============ NEWS VIEWS ============

@@ -2,7 +2,7 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from news.models import News, Category, Country, NewsFilterRule
-from social.models import TelegramChannel, SocialPlatform
+from social.models import BufferAccount, TelegramChannel, SocialPlatform
 from posts.models import PostJob, PostLog
 from datetime import datetime
 
@@ -117,7 +117,59 @@ class SocialPlatformSerializer(serializers.ModelSerializer):
                 enabled=True, is_verified=True
             ).exists()
             return 'connected' if has_verified and obj.enabled else 'disconnected'
+        if obj.name == 'buffer':
+            has_connected = BufferAccount.objects.filter(
+                connection_status='connected'
+            ).exists()
+            return 'connected' if has_connected and obj.enabled else 'disconnected'
         return 'configured' if obj.enabled else 'disabled'
+
+
+# ============ BUFFER SERIALIZERS ============
+
+class BufferConnectSerializer(serializers.Serializer):
+    """Serializer for connecting a Buffer account"""
+    access_token = serializers.CharField(write_only=True)
+    refresh_token = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    token_expires_at = serializers.DateTimeField(required=False, allow_null=True)
+
+
+class BufferAccountStatusSerializer(serializers.ModelSerializer):
+    """Serializer for Buffer account connection status"""
+    connected = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BufferAccount
+        fields = [
+            'id', 'connected', 'connection_status', 'token_expires_at',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = fields
+
+    def get_connected(self, obj):
+        return obj.connection_status == 'connected'
+
+
+class BufferDisconnectedStatusSerializer(serializers.Serializer):
+    """Serializer for disconnected Buffer status responses"""
+    connected = serializers.BooleanField(default=False)
+    connection_status = serializers.CharField(default='disconnected')
+
+
+class BufferProfileSerializer(serializers.Serializer):
+    """Serializer for Buffer profile data returned by Buffer"""
+    id = serializers.CharField(required=False)
+    service = serializers.CharField(required=False, allow_blank=True)
+    service_username = serializers.CharField(required=False, allow_blank=True)
+    formatted_username = serializers.CharField(required=False, allow_blank=True)
+    avatar = serializers.CharField(required=False, allow_blank=True)
+    default = serializers.BooleanField(required=False)
+    schedules = serializers.ListField(required=False)
+
+
+class BufferTestSerializer(serializers.Serializer):
+    """Serializer for testing a Buffer connection"""
+    access_token = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
 
 # ============ POST JOB SERIALIZERS ============
@@ -128,18 +180,20 @@ class PostJobSerializer(serializers.ModelSerializer):
     news_title = serializers.CharField(source='news.title', read_only=True)
     platform_name = serializers.CharField(source='platform.get_name_display', read_only=True)
     channel_name = serializers.SerializerMethodField()
+    buffer_account_name = serializers.SerializerMethodField()
     time_ago = serializers.SerializerMethodField()
     
     class Meta:
         model = PostJob
         fields = [
             'id', 'news', 'news_title', 'platform', 'platform_name',
-            'telegram_channel', 'channel_name', 'status', 'posted_at',
+            'telegram_channel', 'buffer_account', 'channel_name', 'buffer_account_name',
+            'status', 'posted_at',
             'response', 'message_id', 'retry_count', 'max_retries',
             'next_retry_at', 'last_error', 'time_ago', 'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'id', 'news', 'platform', 'telegram_channel', 'status',
+            'id', 'news', 'platform', 'telegram_channel', 'buffer_account', 'status',
             'posted_at', 'response', 'message_id', 'retry_count',
             'next_retry_at', 'last_error', 'created_at', 'updated_at'
         ]
@@ -148,6 +202,12 @@ class PostJobSerializer(serializers.ModelSerializer):
         """Get channel name for Telegram posts"""
         if obj.telegram_channel:
             return obj.telegram_channel.name
+        return None
+
+    def get_buffer_account_name(self, obj):
+        """Get a readable Buffer account label"""
+        if obj.buffer_account:
+            return str(obj.buffer_account)
         return None
     
     def get_time_ago(self, obj):
@@ -192,6 +252,10 @@ class PostJobCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({
                     "telegram_channel_id": "Telegram channel not found or not verified"
                 })
+        elif platform.name != 'buffer':
+            raise serializers.ValidationError({
+                "platform_id": "Only Telegram and Buffer platforms are supported"
+            })
         
         return data
 

@@ -2,7 +2,7 @@
 from django.db import models
 from django.utils import timezone
 from news.models import News
-from social.models import SocialPlatform, TelegramChannel
+from social.models import BufferAccount, SocialPlatform, TelegramChannel
 
 class PostJob(models.Model):
     """Queue job for posting to platforms"""
@@ -22,6 +22,15 @@ class PostJob(models.Model):
     # If platform is Telegram, link to specific channel
     telegram_channel = models.ForeignKey(TelegramChannel, on_delete=models.CASCADE, 
                                          null=True, blank=True)
+
+    # If platform is Buffer, link to the Buffer account used to publish
+    buffer_account = models.ForeignKey(
+        BufferAccount,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='post_jobs'
+    )
     
     # Job status
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', 

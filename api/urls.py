@@ -25,6 +25,13 @@ urlpatterns = [
     
     # Settings endpoints
     path('settings/', SystemSettingsView.as_view(), name='settings'),
+
+    # Buffer endpoints
+    path('buffer/connect/', BufferConnectView.as_view(), name='buffer-connect'),
+    path('buffer/status/', BufferStatusView.as_view(), name='buffer-status'),
+    path('buffer/profiles/', BufferProfilesView.as_view(), name='buffer-profiles'),
+    path('buffer/disconnect/', BufferDisconnectView.as_view(), name='buffer-disconnect'),
+    path('buffer/test/', BufferTestView.as_view(), name='buffer-test'),
     
     # Platform management endpoints
     path('platforms/connect/', PlatformConnectionView.as_view(), name='platform-connect'),

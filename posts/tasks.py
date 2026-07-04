@@ -1,10 +1,12 @@
 # posts/tasks.py
 from celery import shared_task
+from django.db import models
 from django.utils import timezone
 from django.db import transaction
 from .models import PostJob, PostLog
+from social.buffer import BufferService
 from social.telegram import TelegramService, TelegramPostFormatter
-from social.models import TelegramChannel
+from social.models import BufferAccount, TelegramChannel
 
 @shared_task
 def process_post_job(job_id):
@@ -34,12 +36,8 @@ def process_post_job(job_id):
         # Process based on platform
         if job.platform.name == 'telegram':
             result = process_telegram_job(job)
-        elif job.platform.name == 'twitter':
-            result = process_twitter_job(job)
-        elif job.platform.name == 'facebook':
-            result = process_facebook_job(job)
-        elif job.platform.name == 'instagram':
-            result = process_instagram_job(job)
+        elif job.platform.name == 'buffer':
+            result = process_buffer_job(job)
         else:
             raise ValueError(f"Unknown platform: {job.platform.name}")
         
@@ -119,22 +117,110 @@ def process_telegram_job(job):
     }
 
 
-def process_twitter_job(job):
-    """Process a Twitter/X post job"""
-    # TODO: Implement Twitter API v2
-    raise NotImplementedError("Twitter integration not yet implemented")
+def process_buffer_job(job):
+    """Process a Buffer post job"""
+
+    buffer_account = job.buffer_account
+    if not buffer_account:
+        buffer_account = BufferAccount.objects.filter(
+            connection_status='connected'
+        ).order_by('-updated_at').first()
+
+    if not buffer_account:
+        raise ValueError("Buffer account not specified for job")
+
+    news = job.news
+    service = BufferService(buffer_account.access_token)
+    profiles_payload = service.get_profiles()
+    profile_ids = _extract_buffer_profile_ids(profiles_payload)
+
+    if not profile_ids:
+        raise ValueError("No Buffer profiles available for the connected account")
+
+    message = _build_buffer_message(news)
+    media = None
+    if news.image:
+        media = {
+            'link': news.image,
+            'description': news.title,
+            'title': news.title,
+        }
+
+    response = service.publish_post(
+        profile_ids=profile_ids,
+        text=message,
+        media=media
+    )
+
+    return {
+        'response': response,
+        'message_id': _extract_buffer_post_id(response)
+    }
 
 
-def process_facebook_job(job):
-    """Process a Facebook post job"""
-    # TODO: Implement Facebook Graph API
-    raise NotImplementedError("Facebook integration not yet implemented")
+def _build_buffer_message(news):
+    """Create a plain-text Buffer message."""
+    summary = (news.summary or '').strip()
+    if summary:
+        summary = summary[:500]
+        return f"{news.title}\n\n{summary}\n\n{news.link}"
+
+    return f"{news.title}\n\n{news.link}"
 
 
-def process_instagram_job(job):
-    """Process an Instagram post job"""
-    # TODO: Implement Instagram Graph API
-    raise NotImplementedError("Instagram integration not yet implemented")
+def _extract_buffer_profile_ids(payload):
+    """Extract the Buffer profile ids to publish to."""
+    profiles = []
+
+    if isinstance(payload, dict):
+        profiles = payload.get('profiles') or payload.get('data') or []
+    elif isinstance(payload, list):
+        profiles = payload
+
+    if not isinstance(profiles, list):
+        profiles = [profiles]
+
+    default_profiles = []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_id = profile.get('id') or profile.get('profile_id')
+        if not profile_id:
+            continue
+        if profile.get('default'):
+            default_profiles.append(str(profile_id))
+
+    if default_profiles:
+        return default_profiles
+
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_id = profile.get('id') or profile.get('profile_id')
+        if profile_id:
+            return [str(profile_id)]
+
+    return []
+
+
+def _extract_buffer_post_id(response):
+    """Extract a stable post identifier from Buffer's response."""
+    if isinstance(response, dict):
+        for key in ('id', 'update_id', 'updateId', 'post_id', 'postId'):
+            value = response.get(key)
+            if value:
+                return str(value)
+
+        updates = response.get('updates')
+        if isinstance(updates, list) and updates:
+            first_update = updates[0]
+            if isinstance(first_update, dict):
+                for key in ('id', 'update_id', 'post_id'):
+                    value = first_update.get(key)
+                    if value:
+                        return str(value)
+
+    return None
 
 
 @shared_task

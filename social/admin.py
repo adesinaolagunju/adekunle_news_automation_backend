@@ -1,6 +1,6 @@
 # social/admin.py
 from django.contrib import admin
-from .models import TelegramChannel, SocialPlatform
+from .models import BufferAccount, TelegramChannel, SocialPlatform
 
 @admin.register(TelegramChannel)
 class TelegramChannelAdmin(admin.ModelAdmin):
@@ -27,3 +27,22 @@ class SocialPlatformAdmin(admin.ModelAdmin):
     list_display = ['get_name_display', 'enabled']
     list_editable = ['enabled']
 
+
+@admin.register(BufferAccount)
+class BufferAccountAdmin(admin.ModelAdmin):
+    list_display = ['id', 'user', 'connection_status', 'token_expires_at', 'created_at']
+    list_filter = ['connection_status', 'created_at']
+    search_fields = ['user__username', 'user__email']
+    readonly_fields = ['created_at', 'updated_at']
+    ordering = ['-created_at']
+    fieldsets = (
+        ('Account', {
+            'fields': ('user', 'connection_status')
+        }),
+        ('Tokens', {
+            'fields': ('access_token', 'refresh_token', 'token_expires_at')
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at')
+        }),
+    )
