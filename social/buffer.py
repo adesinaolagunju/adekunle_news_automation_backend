@@ -16,8 +16,7 @@ Notes / caveats (as of this writing, the API is still in public beta):
   modes are addToQueue (next open slot) and customScheduled (specific
   dueAt). publish_now() below approximates "now" with customScheduled,
   but confirm against the API Explorer if exact timing matters.
-- Media: only imageUrl is documented for image posts; there's no
-  arbitrary link-preview/media dict like the old REST API had.
+- Media is passed via `assets[{image:{url:...}}]` per the AssetInput schema
 - delete_post()/edit_post() field shapes aren't fully confirmed here -
   verify DeletePostInput / EditPostInput in the API Explorer
   (https://developers.buffer.com) before relying on them in production.
@@ -110,19 +109,32 @@ class BufferService:
     def _extract_top_level_error(body):
         errors = body.get("errors") if isinstance(body, dict) else None
         if errors:
-            messages = [
-                err.get("message") for err in errors
-                if isinstance(err, dict) and err.get("message")
-            ]
-            if messages:
-                return "; ".join(messages)
+            parts = []
+            for err in errors:
+                if not isinstance(err, dict):
+                    continue
+                msg = err.get("message")
+                if msg:
+                    parts.append(msg)
+                ext = err.get("extensions")
+                if isinstance(ext, dict):
+                    code = ext.get("code")
+                    if code:
+                        parts.append(f"[code={code}]")
+                loc = err.get("locations")
+                if isinstance(loc, list) and loc:
+                    parts.append(f"at line {loc[0].get('line', '?')}")
+            if parts:
+                return "; ".join(parts)
         return None
 
     @staticmethod
     def _raise_if_mutation_error(result, action_key, default_message):
         payload = result.get(action_key) if result else None
         if payload is None:
-            raise BufferAPIError(default_message)
+            raise BufferAPIError(
+                f"{default_message}. Full response: {result}"
+            )
         if "message" in payload and "post" not in payload:
             raise BufferAPIError(payload["message"])
         return payload
@@ -153,10 +165,11 @@ class BufferService:
     def get_channels(self, organization_id):
         """Return channels (connected social profiles) for an organization."""
         query = """
-        query GetChannels($organizationId: ID!) {
+        query GetChannels($organizationId: OrganizationId!) {
           channels(input: { organizationId: $organizationId }) {
             id
             name
+            displayName
             service
             avatar
             isQueuePaused
@@ -184,7 +197,7 @@ class BufferService:
         if metadata:
             post_input["metadata"] = metadata
         if image_url:
-            post_input["imageUrl"] = image_url
+            post_input["assets"] = [{"image": {"url": image_url}}]
         if save_to_draft:
             post_input["saveToDraft"] = True
 
@@ -254,7 +267,7 @@ class BufferService:
     def get_posts(self, organization_id, channel_id=None, first=20, after=None):
         """List posts for an organization, optionally filtered by channel, with cursor pagination."""
         query = """
-        query GetPosts($first: Int, $after: String, $input: PostsFilterInput!) {
+        query GetPosts($first: Int, $after: String, $input: PostsInput!) {
           posts(first: $first, after: $after, input: $input) {
             edges {
               node {
@@ -271,11 +284,11 @@ class BufferService:
           }
         }
         """
-        post_filter = {"organizationId": organization_id}
+        post_input = {"organizationId": organization_id}
         if channel_id:
-            post_filter["channelIds"] = [channel_id]
+            post_input["filter"] = {"channelIds": [channel_id]}
 
-        variables = {"first": first, "after": after, "input": post_filter}
+        variables = {"first": first, "after": after, "input": post_input}
         data = self._request(query, variables=variables)
         return data.get("posts", {})
 

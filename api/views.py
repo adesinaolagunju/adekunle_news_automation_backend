@@ -120,6 +120,11 @@ class BufferConnectView(BufferAPIView):
         account.connection_status = 'connected'
         account.save()
 
+        SocialPlatform.objects.get_or_create(
+            name='buffer',
+            defaults={'enabled': False},
+        )
+
         return Response({
             'success': True,
             'account': BufferAccountStatusSerializer(account).data
@@ -288,9 +293,9 @@ class BufferTestView(BufferAPIView):
         responses={202: {'type': 'object', 'properties': {'task_id': {'type': 'string'}, 'message': {'type': 'string'}}}}
     ),
     repost=extend_schema(
-        summary="Repost a news article",
-        description="Manually repost a specific news article to all enabled platforms",
-        responses={200: {'type': 'object', 'properties': {'message': {'type': 'string'}, 'job_ids': {'type': 'array'}}}}
+        summary="Repost a news article via Buffer",
+        description="Manually repost a specific news article through the authenticated user's connected Buffer account.",
+        responses={200: {'type': 'object', 'properties': {'message': {'type': 'string'}, 'job_id': {'type': 'integer'}}}}
     ),
 )
 
@@ -392,49 +397,38 @@ class NewsViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def repost(self, request, pk=None):
-        """Manually repost a news article"""
+        """Manually repost a news article via the authenticated user's Buffer account."""
         news = self.get_object()
-        
-        # Get enabled supported platforms
-        platforms = SocialPlatform.objects.filter(
-            enabled=True,
-            name__in=['telegram', 'buffer']
-        )
-        if not platforms.exists():
+
+        buffer_account = BufferAccount.objects.filter(
+            user=request.user,
+            connection_status='connected'
+        ).first()
+
+        if not buffer_account:
             return Response(
-                {'error': 'No enabled platforms found'},
+                {'error': 'Buffer is not connected'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        jobs_created = []
-        for platform in platforms:
-            if platform.name == 'telegram':
-                channels = TelegramChannel.objects.filter(enabled=True, is_verified=True)
-                for channel in channels:
-                    job = PostJob.objects.create(
-                        news=news,
-                        platform=platform,
-                        telegram_channel=channel,
-                        status='pending'
-                    )
-                    jobs_created.append(job.id)
-            elif platform.name == 'buffer':
-                buffer_accounts = BufferAccount.objects.filter(
-                    user=request.user,
-                    connection_status='connected'
-                ).order_by('-updated_at')
-                for buffer_account in buffer_accounts:
-                    job = PostJob.objects.create(
-                        news=news,
-                        platform=platform,
-                        buffer_account=buffer_account,
-                        status='pending'
-                    )
-                    jobs_created.append(job.id)
-        
+
+        platform, _ = SocialPlatform.objects.get_or_create(
+            name='buffer',
+            defaults={'enabled': False},
+        )
+
+        with transaction.atomic():
+            job = PostJob.objects.create(
+                news=news,
+                platform=platform,
+                buffer_account=buffer_account,
+                status='pending'
+            )
+
+        process_post_job.delay(job.id)
+
         return Response({
-            'message': f'Created {len(jobs_created)} repost jobs',
-            'job_ids': jobs_created
+            'message': 'Repost job created and queued',
+            'job_id': job.id
         })
 
 

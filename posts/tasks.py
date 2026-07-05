@@ -118,7 +118,12 @@ def process_telegram_job(job):
 
 
 def process_buffer_job(job):
-    """Process a Buffer post job"""
+    """Process a Buffer post job via the new GraphQL API.
+
+    Posts to *all* channels in the account's first organization.
+    If any single-channel post fails, the entire job is marked failed
+    so it can be retried.
+    """
 
     buffer_account = job.buffer_account
     if not buffer_account:
@@ -131,30 +136,38 @@ def process_buffer_job(job):
 
     news = job.news
     service = BufferService(buffer_account.api_key)
-    profiles_payload = service.get_profiles()
-    profile_ids = _extract_buffer_profile_ids(profiles_payload)
 
-    if not profile_ids:
-        raise ValueError("No Buffer profiles available for the connected account")
+    organizations = service.get_organizations()
+    if not organizations:
+        raise ValueError("No Buffer organizations found for the connected account")
+
+    organization_id = organizations[0]['id']
+    channels = service.get_channels(organization_id)
+    if not channels:
+        raise ValueError("No Buffer channels available for the connected account")
 
     message = _build_buffer_message(news)
-    media = None
-    if news.image:
-        media = {
-            'link': news.image,
-            'description': news.title,
-            'title': news.title,
-        }
+    image_url = news.image if news.image else None
 
-    response = service.publish_post(
-        profile_ids=profile_ids,
-        text=message,
-        media=media
-    )
+    results = []
+    for channel in channels:
+        channel_id = channel['id']
+        try:
+            post_result = service.queue_post(
+                channel_id=channel_id,
+                text=message,
+                image_url=image_url,
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Buffer post to channel {channel_id} failed: {exc}"
+            ) from exc
+
+        results.append(post_result)
 
     return {
-        'response': response,
-        'message_id': _extract_buffer_post_id(response)
+        'response': {'channels_posted': len(results), 'results': results},
+        'message_id': _extract_buffer_post_id(results[0]) if results else None,
     }
 
 
@@ -168,58 +181,14 @@ def _build_buffer_message(news):
     return f"{news.title}\n\n{news.link}"
 
 
-def _extract_buffer_profile_ids(payload):
-    """Extract the Buffer profile ids to publish to."""
-    profiles = []
-
-    if isinstance(payload, dict):
-        profiles = payload.get('profiles') or payload.get('data') or []
-    elif isinstance(payload, list):
-        profiles = payload
-
-    if not isinstance(profiles, list):
-        profiles = [profiles]
-
-    default_profiles = []
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        profile_id = profile.get('id') or profile.get('profile_id')
-        if not profile_id:
-            continue
-        if profile.get('default'):
-            default_profiles.append(str(profile_id))
-
-    if default_profiles:
-        return default_profiles
-
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        profile_id = profile.get('id') or profile.get('profile_id')
-        if profile_id:
-            return [str(profile_id)]
-
-    return []
-
-
 def _extract_buffer_post_id(response):
-    """Extract a stable post identifier from Buffer's response."""
+    """Extract a post id from a single queue_post/createPost response.
+
+    The new GraphQL API returns ``{id: "...", text: "...", dueAt: "..."}``
+    from the ``CreatePost`` mutation.
+    """
     if isinstance(response, dict):
-        for key in ('id', 'update_id', 'updateId', 'post_id', 'postId'):
-            value = response.get(key)
-            if value:
-                return str(value)
-
-        updates = response.get('updates')
-        if isinstance(updates, list) and updates:
-            first_update = updates[0]
-            if isinstance(first_update, dict):
-                for key in ('id', 'update_id', 'post_id'):
-                    value = first_update.get(key)
-                    if value:
-                        return str(value)
-
+        return str(response.get('id')) if response.get('id') else None
     return None
 
 
