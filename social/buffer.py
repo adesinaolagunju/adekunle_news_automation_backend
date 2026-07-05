@@ -139,6 +139,51 @@ class BufferService:
             raise BufferAPIError(payload["message"])
         return payload
 
+    @staticmethod
+    def _service_to_metadata_key(service):
+        """Map a channel service value to its PostInputMetaData field name."""
+        mapping = {
+            'instagram': 'instagram',
+            'facebook': 'facebook',
+            'twitter': 'twitter',
+            'tiktok': 'tiktok',
+            'linkedin': 'linkedin',
+            'pinterest': 'pinterest',
+            'youtube': 'youtube',
+            'google_my_business': 'googleBusiness',
+            'mastodon': 'mastodon',
+            'threads': 'threads',
+            'bluesky': 'bluesky',
+        }
+        return mapping.get(service)
+
+    @staticmethod
+    def _add_platform_metadata(post_input, service):
+        """Mutate *post_input* with platform-specific metadata for *service*.
+
+        Called after the base ``post_input`` dict is assembled so that
+        required per-platform fields (e.g. Instagram/Facebook ``type``) are
+        present before the mutation is sent.
+        """
+        meta_key = BufferService._service_to_metadata_key(service)
+        if meta_key is None:
+            return
+
+        post_input.setdefault("metadata", {})
+        existing = post_input["metadata"].get(meta_key, {})
+
+        if service == 'instagram':
+            existing.setdefault("type", "post")
+            existing.setdefault("shouldShareToFeed", True)
+        elif service == 'facebook':
+            existing.setdefault("type", "post")
+        elif service == 'tiktok':
+            pass
+        elif service == 'twitter':
+            pass
+
+        post_input["metadata"][meta_key] = existing
+
     def test_connection(self):
         """Validate the API key and return the account, including organizations."""
         query = """
@@ -180,7 +225,8 @@ class BufferService:
         return data.get("channels", [])
 
     def _create_post(self, channel_id, text, mode, due_at=None,
-                      metadata=None, image_url=None, save_to_draft=False):
+                      metadata=None, image_url=None, save_to_draft=False,
+                      service=None):
         if not channel_id:
             raise ValueError("channel_id is required")
         if not text:
@@ -200,6 +246,9 @@ class BufferService:
             post_input["assets"] = [{"image": {"url": image_url}}]
         if save_to_draft:
             post_input["saveToDraft"] = True
+
+        if service:
+            self._add_platform_metadata(post_input, service)
 
         query = """
         mutation CreatePost($input: CreatePostInput!) {
@@ -223,30 +272,53 @@ class BufferService:
         )
         return result.get("post", result)
 
-    def queue_post(self, channel_id, text, metadata=None, image_url=None):
-        """Add a post to the channel's queue (next available time slot)."""
+    def queue_post(self, channel_id, text, metadata=None, image_url=None,
+                    service=None):
+        """Add a post to the channel's queue (next available time slot).
+
+        Parameters
+        ----------
+        channel_id : str
+            Buffer channel ID to post to.
+        text : str
+            Post body text.
+        metadata : dict or None
+            Arbitrary extra ``CreatePostInput`` fields.
+        image_url : str or None
+            Public URL of an image to attach.
+        service : str or None
+            Channel service name (e.g. ``"instagram"``, ``"facebook"``).
+            When provided, platform-required fields (e.g. Instagram
+            ``type``) are injected automatically.
+        """
         return self._create_post(
             channel_id, text, mode="addToQueue",
             metadata=metadata, image_url=image_url,
+            service=service,
         )
 
-    def schedule_post(self, channel_id, text, due_at, metadata=None, image_url=None):
+    def schedule_post(self, channel_id, text, due_at, metadata=None,
+                       image_url=None, service=None):
         """Schedule a post for a specific ISO 8601 UTC timestamp, e.g. '2026-07-10T15:00:00.000Z'."""
         if not due_at:
             raise ValueError("due_at is required when scheduling a Buffer post")
         return self._create_post(
             channel_id, text, mode="customScheduled", due_at=due_at,
             metadata=metadata, image_url=image_url,
+            service=service,
         )
 
-    def draft_post(self, channel_id, text, metadata=None, image_url=None):
+    def draft_post(self, channel_id, text, metadata=None, image_url=None,
+                    service=None):
         """Save a post as a draft rather than queueing/scheduling it."""
         return self._create_post(
             channel_id, text, mode="addToQueue",
             metadata=metadata, image_url=image_url, save_to_draft=True,
+            service=service,
         )
 
-    def publish_now(self, channel_id, text, metadata=None, image_url=None):
+    def publish_now(self, channel_id, text, metadata=None, image_url=None,
+                     service=None):
         """
         Best-effort 'publish immediately'.
 
@@ -261,7 +333,8 @@ class BufferService:
         from datetime import datetime, timezone
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         return self.schedule_post(
-            channel_id, text, due_at=now_iso, metadata=metadata, image_url=image_url,
+            channel_id, text, due_at=now_iso, metadata=metadata,
+            image_url=image_url, service=service,
         )
 
     def get_posts(self, organization_id, channel_id=None, first=20, after=None):

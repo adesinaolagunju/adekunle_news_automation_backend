@@ -121,8 +121,10 @@ def process_buffer_job(job):
     """Process a Buffer post job via the new GraphQL API.
 
     Posts to *all* channels in the account's first organization.
-    If any single-channel post fails, the entire job is marked failed
-    so it can be retried.
+    Partial success is tolerated — if some channels succeed and others
+    fail, the job is marked successful and the failures are recorded
+    in the response.  Only when *every* channel fails does the job
+    itself fail.
     """
 
     buffer_account = job.buffer_account
@@ -149,25 +151,55 @@ def process_buffer_job(job):
     message = _build_buffer_message(news)
     image_url = news.image if news.image else None
 
-    results = []
+    succeeded = []
+    failures = []
+
     for channel in channels:
         channel_id = channel['id']
+        service_name = channel.get('service', 'unknown')
+        display_name = channel.get('displayName') or channel.get('name', channel_id)
+
         try:
             post_result = service.queue_post(
                 channel_id=channel_id,
                 text=message,
                 image_url=image_url,
+                service=service_name,
             )
+            succeeded.append({
+                'channel_id': channel_id,
+                'service': service_name,
+                'display_name': display_name,
+                'result': post_result,
+            })
         except Exception as exc:
-            raise ValueError(
-                f"Buffer post to channel {channel_id} failed: {exc}"
-            ) from exc
+            failures.append({
+                'channel_id': channel_id,
+                'service': service_name,
+                'display_name': display_name,
+                'error': str(exc),
+            })
 
-        results.append(post_result)
+    if failures and not succeeded:
+        all_errors = "; ".join(
+            f"{f['display_name']} ({f['service']}): {f['error']}"
+            for f in failures
+        )
+        raise ValueError(
+            f"All {len(failures)} channel(s) failed: {all_errors}"
+        )
 
     return {
-        'response': {'channels_posted': len(results), 'results': results},
-        'message_id': _extract_buffer_post_id(results[0]) if results else None,
+        'response': {
+            'channels_posted': len(succeeded),
+            'channels_attempted': len(channels),
+            'succeeded': succeeded,
+            'failures': failures,
+        },
+        'message_id': (
+            _extract_buffer_post_id(succeeded[0]['result'])
+            if succeeded else None
+        ),
     }
 
 
