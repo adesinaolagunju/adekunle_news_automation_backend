@@ -33,12 +33,6 @@ urlpatterns = [
     path('buffer/disconnect/', BufferDisconnectView.as_view(), name='buffer-disconnect'),
     path('buffer/test/', BufferTestView.as_view(), name='buffer-test'),
     
-    # Platform management endpoints
-    path('platforms/connect/', PlatformConnectionView.as_view(), name='platform-connect'),
-    path('platforms/connect/<str:platform_name>/', PlatformConnectionView.as_view(), name='platform-update'),
-    path('platforms/test/', PlatformTestView.as_view(), name='platform-test'),
-    path('platforms/bulk-config/', BulkPlatformConfigView.as_view(), name='platform-bulk-config'),
-    
     # Include router URLs
     path('', include(router.urls)),
 ]

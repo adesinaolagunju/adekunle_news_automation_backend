@@ -4,7 +4,8 @@ from django.contrib.auth.models import User
 from news.models import News, Category, Country, NewsFilterRule
 from social.models import BufferAccount, TelegramChannel, SocialPlatform
 from posts.models import PostJob, PostLog
-from datetime import datetime
+
+SUPPORTED_PLATFORM_NAMES = ('telegram', 'buffer')
 
 # ============ NEWS SERIALIZERS ============
 
@@ -118,9 +119,14 @@ class SocialPlatformSerializer(serializers.ModelSerializer):
             ).exists()
             return 'connected' if has_verified and obj.enabled else 'disconnected'
         if obj.name == 'buffer':
-            has_connected = BufferAccount.objects.filter(
-                connection_status='connected'
-            ).exists()
+            request = self.context.get('request')
+            user = getattr(request, 'user', None)
+            has_connected = bool(
+                user and user.is_authenticated and BufferAccount.objects.filter(
+                    user=user,
+                    connection_status='connected'
+                ).exists()
+            )
             return 'connected' if has_connected and obj.enabled else 'disconnected'
         return 'configured' if obj.enabled else 'disabled'
 
@@ -132,6 +138,15 @@ class BufferConnectSerializer(serializers.Serializer):
     access_token = serializers.CharField(write_only=True)
     refresh_token = serializers.CharField(write_only=True, required=False, allow_blank=True)
     token_expires_at = serializers.DateTimeField(required=False, allow_null=True)
+
+    def validate_access_token(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("This field may not be blank.")
+        return value
+
+    def validate_refresh_token(self, value):
+        return value.strip() if value else value
 
 
 class BufferAccountStatusSerializer(serializers.ModelSerializer):
@@ -150,12 +165,6 @@ class BufferAccountStatusSerializer(serializers.ModelSerializer):
         return obj.connection_status == 'connected'
 
 
-class BufferDisconnectedStatusSerializer(serializers.Serializer):
-    """Serializer for disconnected Buffer status responses"""
-    connected = serializers.BooleanField(default=False)
-    connection_status = serializers.CharField(default='disconnected')
-
-
 class BufferProfileSerializer(serializers.Serializer):
     """Serializer for Buffer profile data returned by Buffer"""
     id = serializers.CharField(required=False)
@@ -170,6 +179,9 @@ class BufferProfileSerializer(serializers.Serializer):
 class BufferTestSerializer(serializers.Serializer):
     """Serializer for testing a Buffer connection"""
     access_token = serializers.CharField(write_only=True, required=False, allow_blank=True)
+
+    def validate_access_token(self, value):
+        return value.strip() if value else value
 
 
 # ============ POST JOB SERIALIZERS ============
@@ -224,26 +236,29 @@ class PostJobCreateSerializer(serializers.Serializer):
     
     def validate(self, data):
         """Validate the data"""
-        # Check if news exists
         try:
             news = News.objects.get(id=data['news_id'])
         except News.DoesNotExist:
             raise serializers.ValidationError({"news_id": "News not found"})
         
-        # Check if platform exists and is enabled
         try:
-            platform = SocialPlatform.objects.get(id=data['platform_id'], enabled=True)
+            platform = SocialPlatform.objects.get(
+                id=data['platform_id'],
+                enabled=True,
+                name__in=SUPPORTED_PLATFORM_NAMES
+            )
         except SocialPlatform.DoesNotExist:
-            raise serializers.ValidationError({"platform_id": "Platform not found or disabled"})
+            raise serializers.ValidationError({
+                "platform_id": "Supported platform not found or disabled"
+            })
         
-        # If platform is Telegram, check channel
         if platform.name == 'telegram':
             if not data.get('telegram_channel_id'):
                 raise serializers.ValidationError({
                     "telegram_channel_id": "Required for Telegram platform"
                 })
             try:
-                TelegramChannel.objects.get(
+                channel = TelegramChannel.objects.get(
                     id=data['telegram_channel_id'],
                     enabled=True,
                     is_verified=True
@@ -252,11 +267,24 @@ class PostJobCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({
                     "telegram_channel_id": "Telegram channel not found or not verified"
                 })
-        elif platform.name != 'buffer':
-            raise serializers.ValidationError({
-                "platform_id": "Only Telegram and Buffer platforms are supported"
-            })
+            data['telegram_channel'] = channel
+        else:
+            request = self.context.get('request')
+            user = getattr(request, 'user', None)
+            buffer_account = BufferAccount.objects.filter(
+                user=user,
+                connection_status='connected'
+            ).order_by('-updated_at').first()
+
+            if not buffer_account:
+                raise serializers.ValidationError({
+                    "buffer_account": "No connected Buffer account found"
+                })
+
+            data['buffer_account'] = buffer_account
         
+        data['news'] = news
+        data['platform'] = platform
         return data
 
 
