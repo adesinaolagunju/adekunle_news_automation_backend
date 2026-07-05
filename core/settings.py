@@ -135,7 +135,7 @@ SPECTACULAR_SETTINGS = {
     
     ### Core Features
     - **News Management**: Fetch, filter, and manage news articles
-    - **Social Media Integration**: Post to Telegram, X, Facebook, Instagram
+    - **Social Media Integration**: Post to Telegram and Buffer
     - **Automation**: Schedule and queue posts automatically
     - **Analytics**: Track posting history and performance
     

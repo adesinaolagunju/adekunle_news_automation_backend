@@ -356,8 +356,11 @@ class NewsViewSet(viewsets.ModelViewSet):
         """Manually repost a news article"""
         news = self.get_object()
         
-        # Get enabled platforms
-        platforms = SocialPlatform.objects.filter(enabled=True)
+        # Get enabled supported platforms
+        platforms = SocialPlatform.objects.filter(
+            enabled=True,
+            name__in=['telegram', 'buffer']
+        )
         if not platforms.exists():
             return Response(
                 {'error': 'No enabled platforms found'},
@@ -376,13 +379,18 @@ class NewsViewSet(viewsets.ModelViewSet):
                         status='pending'
                     )
                     jobs_created.append(job.id)
-            else:
-                job = PostJob.objects.create(
-                    news=news,
-                    platform=platform,
-                    status='pending'
-                )
-                jobs_created.append(job.id)
+            elif platform.name == 'buffer':
+                buffer_accounts = BufferAccount.objects.filter(
+                    connection_status='connected'
+                ).order_by('-updated_at')
+                for buffer_account in buffer_accounts:
+                    job = PostJob.objects.create(
+                        news=news,
+                        platform=platform,
+                        buffer_account=buffer_account,
+                        status='pending'
+                    )
+                    jobs_created.append(job.id)
         
         return Response({
             'message': f'Created {len(jobs_created)} repost jobs',
@@ -695,10 +703,20 @@ class PostJobViewSet(viewsets.ModelViewSet):
                     telegram_channel=channel,
                     status='pending'
                 )
-            else:
+            elif platform.name == 'buffer':
+                buffer_account = BufferAccount.objects.filter(
+                    user=request.user,
+                    connection_status='connected'
+                ).order_by('-updated_at').first()
+                if not buffer_account:
+                    return Response({
+                        'error': 'No connected Buffer account found'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
                 job = PostJob.objects.create(
                     news=news,
                     platform=platform,
+                    buffer_account=buffer_account,
                     status='pending'
                 )
         
@@ -970,41 +988,6 @@ Read More👇
                         'channel_chat_id': '-1001234567890'
                     }
                 }
-            ),
-            OpenApiExample(
-                'Add X (Twitter) Platform',
-                value={
-                    'name': 'twitter',
-                    'enabled': True,
-                    'config': {
-                        'api_key': 'your_api_key',
-                        'api_secret': 'your_api_secret',
-                        'access_token': 'your_access_token',
-                        'access_token_secret': 'your_access_token_secret'
-                    }
-                }
-            ),
-            OpenApiExample(
-                'Add Facebook Platform',
-                value={
-                    'name': 'facebook',
-                    'enabled': True,
-                    'config': {
-                        'page_id': 'your_page_id',
-                        'access_token': 'your_facebook_access_token'
-                    }
-                }
-            ),
-            OpenApiExample(
-                'Add Instagram Platform',
-                value={
-                    'name': 'instagram',
-                    'enabled': True,
-                    'config': {
-                        'business_account_id': 'your_business_id',
-                        'access_token': 'your_instagram_access_token'
-                    }
-                }
             )
         ]
     ),
@@ -1097,27 +1080,13 @@ class SocialPlatformViewSet(viewsets.ModelViewSet):
                 ).count(),
                 'total_channels': TelegramChannel.objects.filter(enabled=True).count()
             }
-        elif platform.name == 'twitter':
-            # Check Twitter connection
-            # TODO: Implement Twitter connection check
-            status_data['is_connected'] = platform.config.get('access_token') is not None
+        elif platform.name == 'buffer':
+            connected_accounts = BufferAccount.objects.filter(
+                connection_status='connected'
+            )
+            status_data['is_connected'] = connected_accounts.exists()
             status_data['details'] = {
-                'has_api_key': bool(platform.config.get('api_key')),
-                'has_access_token': bool(platform.config.get('access_token'))
-            }
-        elif platform.name == 'facebook':
-            # Check Facebook connection
-            status_data['is_connected'] = platform.config.get('access_token') is not None
-            status_data['details'] = {
-                'has_page_id': bool(platform.config.get('page_id')),
-                'has_access_token': bool(platform.config.get('access_token'))
-            }
-        elif platform.name == 'instagram':
-            # Check Instagram connection
-            status_data['is_connected'] = platform.config.get('access_token') is not None
-            status_data['details'] = {
-                'has_business_id': bool(platform.config.get('business_account_id')),
-                'has_access_token': bool(platform.config.get('access_token'))
+                'connected_accounts': connected_accounts.count()
             }
         
         return Response(status_data)
@@ -1138,7 +1107,7 @@ class PlatformConnectionView(APIView):
             'application/json': {
                 'type': 'object',
                 'properties': {
-                    'platform': {'type': 'string', 'enum': ['telegram', 'twitter', 'facebook', 'instagram']},
+                    'platform': {'type': 'string', 'enum': ['telegram', 'buffer']},
                     'config': {'type': 'object'},
                     'enabled': {'type': 'boolean', 'default': True}
                 },
@@ -1156,19 +1125,6 @@ class PlatformConnectionView(APIView):
                         'channel_chat_id': '-1001234567890'
                     }
                 }
-            ),
-            OpenApiExample(
-                'Connect Twitter/X',
-                value={
-                    'platform': 'twitter',
-                    'enabled': True,
-                    'config': {
-                        'api_key': 'your_api_key',
-                        'api_secret': 'your_api_secret',
-                        'access_token': 'your_access_token',
-                        'access_token_secret': 'your_access_token_secret'
-                    }
-                }
             )
         ]
     )
@@ -1179,7 +1135,7 @@ class PlatformConnectionView(APIView):
         enabled = request.data.get('enabled', True)
         
         # Validate platform
-        valid_platforms = ['telegram', 'twitter', 'facebook', 'instagram']
+        valid_platforms = ['telegram', 'buffer']
         if platform_name not in valid_platforms:
             return Response({
                 'error': f'Invalid platform. Must be one of: {", ".join(valid_platforms)}'
@@ -1200,29 +1156,6 @@ class PlatformConnectionView(APIView):
             if not config.get('channel_chat_id'):
                 return Response({
                     'error': 'channel_chat_id is required for Telegram'
-                }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Validate Twitter configuration
-        if platform_name == 'twitter':
-            required_fields = ['api_key', 'api_secret', 'access_token', 'access_token_secret']
-            missing_fields = [f for f in required_fields if not config.get(f)]
-            if missing_fields:
-                return Response({
-                    'error': f'Missing required fields for Twitter: {", ".join(missing_fields)}'
-                }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Validate Facebook configuration
-        if platform_name == 'facebook':
-            if not config.get('page_id') and not config.get('access_token'):
-                return Response({
-                    'error': 'page_id and access_token are required for Facebook'
-                }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Validate Instagram configuration
-        if platform_name == 'instagram':
-            if not config.get('business_account_id') and not config.get('access_token'):
-                return Response({
-                    'error': 'business_account_id and access_token are required for Instagram'
                 }, status=status.HTTP_400_BAD_REQUEST)
         
         # Create platform
@@ -1334,7 +1267,7 @@ class PlatformTestView(APIView):
             'application/json': {
                 'type': 'object',
                 'properties': {
-                    'platform': {'type': 'string', 'enum': ['telegram', 'twitter', 'facebook', 'instagram']},
+                    'platform': {'type': 'string', 'enum': ['telegram', 'buffer']},
                     'config': {'type': 'object'}
                 },
                 'required': ['platform']
@@ -1400,17 +1333,27 @@ class PlatformTestView(APIView):
             else:
                 result['message'] = f'Connection failed: {info}'
         
-        elif platform_name == 'twitter':
-            # TODO: Implement Twitter test
-            result['message'] = 'Twitter testing not yet implemented'
-        
-        elif platform_name == 'facebook':
-            # TODO: Implement Facebook test
-            result['message'] = 'Facebook testing not yet implemented'
-        
-        elif platform_name == 'instagram':
-            # TODO: Implement Instagram test
-            result['message'] = 'Instagram testing not yet implemented'
+        elif platform_name == 'buffer':
+            access_token = config.get('access_token')
+            if not access_token:
+                account = BufferAccount.objects.filter(
+                    user=request.user,
+                    connection_status='connected'
+                ).order_by('-updated_at').first()
+                if not account:
+                    return Response({
+                        'error': 'access_token is required for testing Buffer'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                access_token = account.access_token
+
+            service = BufferService(access_token)
+            try:
+                info = service.test_connection()
+                result['success'] = True
+                result['message'] = 'Buffer connection successful'
+                result['details'] = info
+            except BufferServiceError as error:
+                result['message'] = f'Connection failed: {error}'
         
         else:
             return Response({

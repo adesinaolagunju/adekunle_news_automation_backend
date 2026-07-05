@@ -100,9 +100,6 @@ class SocialPlatform(models.Model):
     """Generic social platform configuration"""
     
     PLATFORM_CHOICES = [
-        ('twitter', 'X (Twitter)'),
-        ('facebook', 'Facebook'),
-        ('instagram', 'Instagram'),
         ('telegram', 'Telegram'),
         ('buffer', 'Buffer'),
     ]
