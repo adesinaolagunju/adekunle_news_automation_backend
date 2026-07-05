@@ -1,4 +1,3 @@
-# api/serializers.py
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from news.models import News, Category, Country, NewsFilterRule
@@ -134,19 +133,15 @@ class SocialPlatformSerializer(serializers.ModelSerializer):
 # ============ BUFFER SERIALIZERS ============
 
 class BufferConnectSerializer(serializers.Serializer):
-    """Serializer for connecting a Buffer account"""
-    access_token = serializers.CharField(write_only=True)
-    refresh_token = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    """Serializer for connecting a Buffer account via a personal API key"""
+    api_key = serializers.CharField(write_only=True)
     token_expires_at = serializers.DateTimeField(required=False, allow_null=True)
 
-    def validate_access_token(self, value):
+    def validate_api_key(self, value):
         value = value.strip()
         if not value:
             raise serializers.ValidationError("This field may not be blank.")
         return value
-
-    def validate_refresh_token(self, value):
-        return value.strip() if value else value
 
 
 class BufferAccountStatusSerializer(serializers.ModelSerializer):
@@ -165,22 +160,20 @@ class BufferAccountStatusSerializer(serializers.ModelSerializer):
         return obj.connection_status == 'connected'
 
 
-class BufferProfileSerializer(serializers.Serializer):
-    """Serializer for Buffer profile data returned by Buffer"""
+class BufferChannelSerializer(serializers.Serializer):
+    """Serializer for Buffer channel data returned by the GraphQL API"""
     id = serializers.CharField(required=False)
+    name = serializers.CharField(required=False, allow_blank=True)
     service = serializers.CharField(required=False, allow_blank=True)
-    service_username = serializers.CharField(required=False, allow_blank=True)
-    formatted_username = serializers.CharField(required=False, allow_blank=True)
     avatar = serializers.CharField(required=False, allow_blank=True)
-    default = serializers.BooleanField(required=False)
-    schedules = serializers.ListField(required=False)
+    isQueuePaused = serializers.BooleanField(required=False)
 
 
 class BufferTestSerializer(serializers.Serializer):
     """Serializer for testing a Buffer connection"""
-    access_token = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    api_key = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
-    def validate_access_token(self, value):
+    def validate_api_key(self, value):
         return value.strip() if value else value
 
 

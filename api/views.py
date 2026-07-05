@@ -95,7 +95,7 @@ class BufferAPIView(APIView):
 class BufferConnectView(BufferAPIView):
     @extend_schema(
         summary="Connect Buffer",
-        description="Connect the authenticated user to Buffer using Buffer credentials.",
+        description="Connect the authenticated user to Buffer using a personal API key generated at Settings -> API.",
         request=BufferConnectSerializer,
         responses={200: BufferAccountStatusSerializer}
     )
@@ -104,7 +104,7 @@ class BufferConnectView(BufferAPIView):
         serializer.is_valid(raise_exception=True)
 
         data = serializer.validated_data
-        service = BufferService(data['access_token'])
+        service = BufferService(data['api_key'])
 
         try:
             service.test_connection()
@@ -115,8 +115,7 @@ class BufferConnectView(BufferAPIView):
         if account is None:
             account = BufferAccount(user=request.user)
 
-        account.access_token = data['access_token']
-        account.refresh_token = data.get('refresh_token') or None
+        account.api_key = data['api_key']
         account.token_expires_at = data.get('token_expires_at')
         account.connection_status = 'connected'
         account.save()
@@ -144,23 +143,69 @@ class BufferStatusView(BufferAPIView):
         return Response(BufferAccountStatusSerializer(account).data)
 
 
-class BufferProfilesView(BufferAPIView):
+class BufferOrganizationsView(BufferAPIView):
     @extend_schema(
-        summary="List Buffer profiles",
-        description="Fetch Buffer profiles available to the connected Buffer account.",
-        responses={200: BufferProfileSerializer(many=True)}
+        summary="List Buffer organizations",
+        description="Fetch the Buffer organizations available to the connected account's API key.",
+        responses={200: {'type': 'object'}}
     )
     def get(self, request):
         account = self.get_connected_buffer_account()
-        service = BufferService(account.access_token)
+        service = BufferService(account.api_key)
 
         try:
-            profiles = service.get_profiles()
+            organizations = service.get_organizations()
         except BufferServiceError as error:
             self.raise_buffer_error(error)
 
         return Response({
-            'profiles': profiles
+            'organizations': organizations
+        })
+
+
+class BufferChannelsView(BufferAPIView):
+    """
+    Lists channels (formerly 'profiles') for a Buffer organization.
+
+    Buffer's new API scopes channels under an organization, so an
+    organization_id is required. Pass it as a query param
+    (?organization_id=...); if omitted, the user's first organization
+    is used as a convenience default.
+    """
+
+    @extend_schema(
+        summary="List Buffer channels",
+        description="Fetch Buffer channels for an organization on the connected account.",
+        parameters=[
+            OpenApiParameter(
+                name='organization_id',
+                description='Buffer organization ID. Defaults to the first organization if omitted.',
+                required=False,
+                type=str,
+            ),
+        ],
+        responses={200: BufferChannelSerializer(many=True)}
+    )
+    def get(self, request):
+        account = self.get_connected_buffer_account()
+        service = BufferService(account.api_key)
+
+        organization_id = request.query_params.get('organization_id')
+
+        try:
+            if not organization_id:
+                organizations = service.get_organizations()
+                if not organizations:
+                    raise ValidationError({'buffer': 'No Buffer organizations found for this account'})
+                organization_id = organizations[0]['id']
+
+            channels = service.get_channels(organization_id)
+        except BufferServiceError as error:
+            self.raise_buffer_error(error)
+
+        return Response({
+            'organization_id': organization_id,
+            'channels': channels
         })
 
 
@@ -184,7 +229,7 @@ class BufferDisconnectView(BufferAPIView):
 class BufferTestView(BufferAPIView):
     @extend_schema(
         summary="Test Buffer connection",
-        description="Test a supplied Buffer access token or the authenticated user's stored Buffer token.",
+        description="Test a supplied Buffer personal API key or the authenticated user's stored key.",
         request=BufferTestSerializer,
         responses={200: {'type': 'object'}}
     )
@@ -192,26 +237,26 @@ class BufferTestView(BufferAPIView):
         serializer = BufferTestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        access_token = serializer.validated_data.get('access_token')
-        if not access_token:
+        api_key = serializer.validated_data.get('api_key')
+        if not api_key:
             account = self.get_buffer_account()
             if account is None:
                 raise ValidationError({
-                    'access_token': 'Buffer is not connected and no access_token was provided'
+                    'api_key': 'Buffer is not connected and no api_key was provided'
                 })
-            access_token = account.access_token
+            api_key = account.api_key
 
-        service = BufferService(access_token)
+        service = BufferService(api_key)
 
         try:
-            user_info = service.test_connection()
+            account_info = service.test_connection()
         except BufferServiceError as error:
             self.raise_buffer_error(error)
 
         return Response({
             'success': True,
             'message': 'Buffer connection successful',
-            'user': user_info
+            'account': account_info
         })
 
 

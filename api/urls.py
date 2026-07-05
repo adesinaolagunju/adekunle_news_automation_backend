@@ -31,7 +31,8 @@ urlpatterns = [
     # Buffer endpoints
     path('buffer/connect/', BufferConnectView.as_view(), name='buffer-connect'),
     path('buffer/status/', BufferStatusView.as_view(), name='buffer-status'),
-    path('buffer/profiles/', BufferProfilesView.as_view(), name='buffer-profiles'),
+    path('buffer/organizations/', BufferOrganizationsView.as_view(), name='buffer-organizations'),
+    path('buffer/channels/', BufferChannelsView.as_view(), name='buffer-channels'),
     path('buffer/disconnect/', BufferDisconnectView.as_view(), name='buffer-disconnect'),
     path('buffer/test/', BufferTestView.as_view(), name='buffer-test'),
     

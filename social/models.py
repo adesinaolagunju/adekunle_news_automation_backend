@@ -118,7 +118,7 @@ class SocialPlatform(models.Model):
 
 
 class BufferAccount(models.Model):
-    """Store a user's Buffer OAuth credentials and connection state."""
+    """Store a user's Buffer personal API key and connection state."""
 
     CONNECTION_STATUS_CHOICES = [
         ('pending', 'Pending'),
@@ -133,8 +133,7 @@ class BufferAccount(models.Model):
         on_delete=models.CASCADE,
         related_name='buffer_accounts'
     )
-    access_token = EncryptedTextField()
-    refresh_token = EncryptedTextField(blank=True, null=True)
+    api_key = EncryptedTextField()
     token_expires_at = models.DateTimeField(blank=True, null=True)
     connection_status = models.CharField(
         max_length=20,

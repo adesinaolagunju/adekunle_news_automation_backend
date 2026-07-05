@@ -40,7 +40,7 @@ class BufferAccountAdmin(admin.ModelAdmin):
             'fields': ('user', 'connection_status')
         }),
         ('Tokens', {
-            'fields': ('access_token', 'refresh_token', 'token_expires_at')
+            'fields': ('api_key', 'token_expires_at')
         }),
         ('Timestamps', {
             'fields': ('created_at', 'updated_at')

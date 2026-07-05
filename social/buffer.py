@@ -1,4 +1,27 @@
-# social/buffer.py
+"""
+social/buffer.py
+
+Client for Buffer's current GraphQL API (https://api.buffer.com).
+
+Buffer retired new developer registrations for the legacy REST API
+(api.bufferapp.com/1, OAuth2 client_id/secret flow). Personal API keys
+generated from Settings -> API (publish.buffer.com/settings/api) only work
+against this new GraphQL endpoint, authenticated with a Bearer token.
+
+Notes / caveats (as of this writing, the API is still in public beta):
+- "Profiles" are now called "channels".
+- Posts belong to a single channelId (no more posting to several
+  profile_ids in one call) - loop and call create_post per channel.
+- There is no documented "publish immediately" mode. The two supported
+  modes are addToQueue (next open slot) and customScheduled (specific
+  dueAt). publish_now() below approximates "now" with customScheduled,
+  but confirm against the API Explorer if exact timing matters.
+- Media: only imageUrl is documented for image posts; there's no
+  arbitrary link-preview/media dict like the old REST API had.
+- delete_post()/edit_post() field shapes aren't fully confirmed here -
+  verify DeletePostInput / EditPostInput in the API Explorer
+  (https://developers.buffer.com) before relying on them in production.
+"""
 
 import requests
 
@@ -8,42 +31,39 @@ class BufferServiceError(Exception):
 
 
 class BufferAuthenticationError(BufferServiceError):
-    """Raised when Buffer rejects or cannot authenticate the token."""
+    """Raised when Buffer rejects or cannot authenticate the API key."""
 
 
 class BufferAPIError(BufferServiceError):
-    """Raised when Buffer returns an API-level error."""
+    """Raised when Buffer returns a GraphQL-level error."""
 
 
 class BufferService:
-    """Service for interacting with Buffer's publishing API."""
+    """Service for interacting with Buffer's GraphQL API."""
 
-    BASE_URL = "https://api.bufferapp.com/1"
+    BASE_URL = "https://api.buffer.com"
 
-    def __init__(self, access_token, timeout=30):
-        if not access_token:
-            raise ValueError("Buffer access token is required")
+    def __init__(self, api_key, timeout=30):
+        if not api_key:
+            raise ValueError("Buffer API key is required")
 
-        self.access_token = access_token
+        self.api_key = api_key
         self.timeout = timeout
         self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        })
 
-    def _request(self, method, endpoint, params=None, data=None):
-        url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
-        params = params.copy() if params else {}
-        data = data.copy() if data else {}
-
-        if method.upper() == "GET":
-            params["access_token"] = self.access_token
-        else:
-            data["access_token"] = self.access_token
+    def _request(self, query, variables=None):
+        payload = {"query": query}
+        if variables is not None:
+            payload["variables"] = variables
 
         try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                data=data,
+            response = self.session.post(
+                self.BASE_URL,
+                json=payload,
                 timeout=self.timeout,
             )
         except requests.Timeout as exc:
@@ -53,139 +73,237 @@ class BufferService:
         except requests.RequestException as exc:
             raise BufferServiceError(f"Buffer request failed: {exc}") from exc
 
+        if response.status_code in (401, 403):
+            raise BufferAuthenticationError(
+                "Buffer rejected the API key (401/403). Regenerate it at "
+                "Settings -> API if it may have expired."
+            )
+
         try:
-            payload = response.json()
+            body = response.json()
         except ValueError as exc:
             raise BufferAPIError(
                 f"Buffer returned a non-JSON response with status {response.status_code}"
             ) from exc
 
-        if response.status_code in (401, 403):
-            message = self._extract_error_message(payload, "Buffer authentication failed")
-            raise BufferAuthenticationError(message)
-
         if response.status_code >= 400:
-            message = self._extract_error_message(
-                payload,
-                f"Buffer API request failed with status {response.status_code}",
+            message = self._extract_top_level_error(body) or (
+                f"Buffer API request failed with status {response.status_code}"
             )
             raise BufferAPIError(message)
 
-        if isinstance(payload, dict) and payload.get("success") is False:
-            message = self._extract_error_message(payload, "Buffer API request was unsuccessful")
+        errors = body.get("errors")
+        if errors:
+            message = self._extract_top_level_error(body)
+            codes = {
+                (err.get("extensions") or {}).get("code")
+                for err in errors
+                if isinstance(err, dict)
+            }
+            if codes & {"UNAUTHORIZED", "FORBIDDEN"}:
+                raise BufferAuthenticationError(message)
             raise BufferAPIError(message)
 
-        return payload
+        return body.get("data") or {}
 
     @staticmethod
-    def _extract_error_message(payload, default):
-        if isinstance(payload, dict):
-            for key in ("message", "error", "error_message"):
-                value = payload.get(key)
-                if value:
-                    return str(value)
+    def _extract_top_level_error(body):
+        errors = body.get("errors") if isinstance(body, dict) else None
+        if errors:
+            messages = [
+                err.get("message") for err in errors
+                if isinstance(err, dict) and err.get("message")
+            ]
+            if messages:
+                return "; ".join(messages)
+        return None
 
-            errors = payload.get("errors")
-            if errors:
-                return str(errors)
-
-        return default
+    @staticmethod
+    def _raise_if_mutation_error(result, action_key, default_message):
+        payload = result.get(action_key) if result else None
+        if payload is None:
+            raise BufferAPIError(default_message)
+        if "message" in payload and "post" not in payload:
+            raise BufferAPIError(payload["message"])
+        return payload
 
     def test_connection(self):
-        """Validate the access token and return Buffer user/account data."""
-        return self._request("GET", "user.json")
+        """Validate the API key and return the account, including organizations."""
+        query = """
+        query GetAccount {
+          account {
+            id
+            email
+            name
+            organizations {
+              id
+              name
+            }
+          }
+        }
+        """
+        data = self._request(query)
+        return data.get("account")
 
-    def get_profiles(self):
-        """Return Buffer profiles available to the authenticated account."""
-        return self._request("GET", "profiles.json")
+    def get_organizations(self):
+        """Return the organizations available to this API key."""
+        account = self.test_connection()
+        return (account or {}).get("organizations", [])
 
-    def create_post(self, profile_ids, text, media=None, shorten=True):
-        """Create a queued Buffer post for one or more profiles."""
-        return self._create_update(
-            profile_ids=profile_ids,
-            text=text,
-            media=media,
-            shorten=shorten,
-        )
+    def get_channels(self, organization_id):
+        """Return channels (connected social profiles) for an organization."""
+        query = """
+        query GetChannels($organizationId: ID!) {
+          channels(input: { organizationId: $organizationId }) {
+            id
+            name
+            service
+            avatar
+            isQueuePaused
+          }
+        }
+        """
+        data = self._request(query, variables={"organizationId": organization_id})
+        return data.get("channels", [])
 
-    def schedule_post(self, profile_ids, text, scheduled_at, media=None, shorten=True):
-        """Create a Buffer post scheduled for a specific Unix timestamp or datetime string."""
-        if not scheduled_at:
-            raise ValueError("scheduled_at is required when scheduling a Buffer post")
-
-        return self._create_update(
-            profile_ids=profile_ids,
-            text=text,
-            media=media,
-            shorten=shorten,
-            scheduled_at=scheduled_at,
-        )
-
-    def publish_post(self, profile_ids, text, media=None, shorten=True):
-        """Create and publish a Buffer post immediately."""
-        return self._create_update(
-            profile_ids=profile_ids,
-            text=text,
-            media=media,
-            shorten=shorten,
-            now=True,
-        )
-
-    def _create_update(
-        self,
-        profile_ids,
-        text,
-        media=None,
-        shorten=True,
-        now=False,
-        scheduled_at=None,
-    ):
-        if not profile_ids:
-            raise ValueError("At least one Buffer profile id is required")
-
+    def _create_post(self, channel_id, text, mode, due_at=None,
+                      metadata=None, image_url=None, save_to_draft=False):
+        if not channel_id:
+            raise ValueError("channel_id is required")
         if not text:
             raise ValueError("Post text is required")
 
-        if isinstance(profile_ids, str):
-            profile_ids = [profile_ids]
-
-        data = {
+        post_input = {
             "text": text,
-            "shorten": "true" if shorten else "false",
+            "channelId": channel_id,
+            "schedulingType": "automatic",
+            "mode": mode,
         }
+        if due_at:
+            post_input["dueAt"] = due_at
+        if metadata:
+            post_input["metadata"] = metadata
+        if image_url:
+            post_input["imageUrl"] = image_url
+        if save_to_draft:
+            post_input["saveToDraft"] = True
 
-        for index, profile_id in enumerate(profile_ids):
-            data[f"profile_ids[{index}]"] = profile_id
+        query = """
+        mutation CreatePost($input: CreatePostInput!) {
+          createPost(input: $input) {
+            ... on PostActionSuccess {
+              post {
+                id
+                text
+                dueAt
+              }
+            }
+            ... on MutationError {
+              message
+            }
+          }
+        }
+        """
+        data = self._request(query, variables={"input": post_input})
+        result = self._raise_if_mutation_error(
+            data, "createPost", "Buffer did not return a post creation result"
+        )
+        return result.get("post", result)
 
-        if now:
-            data["now"] = "true"
+    def queue_post(self, channel_id, text, metadata=None, image_url=None):
+        """Add a post to the channel's queue (next available time slot)."""
+        return self._create_post(
+            channel_id, text, mode="addToQueue",
+            metadata=metadata, image_url=image_url,
+        )
 
-        if scheduled_at:
-            data["scheduled_at"] = scheduled_at
+    def schedule_post(self, channel_id, text, due_at, metadata=None, image_url=None):
+        """Schedule a post for a specific ISO 8601 UTC timestamp, e.g. '2026-07-10T15:00:00.000Z'."""
+        if not due_at:
+            raise ValueError("due_at is required when scheduling a Buffer post")
+        return self._create_post(
+            channel_id, text, mode="customScheduled", due_at=due_at,
+            metadata=metadata, image_url=image_url,
+        )
 
-        if media:
-            self._add_media(data, media)
+    def draft_post(self, channel_id, text, metadata=None, image_url=None):
+        """Save a post as a draft rather than queueing/scheduling it."""
+        return self._create_post(
+            channel_id, text, mode="addToQueue",
+            metadata=metadata, image_url=image_url, save_to_draft=True,
+        )
 
-        return self._request("POST", "updates/create.json", data=data)
+    def publish_now(self, channel_id, text, metadata=None, image_url=None):
+        """
+        Best-effort 'publish immediately'.
 
-    @staticmethod
-    def _add_media(data, media):
-        if not isinstance(media, dict):
-            raise ValueError("media must be a dictionary")
+        The current beta GraphQL API has no documented immediate-publish
+        mode - only addToQueue and customScheduled. This schedules the
+        post for "now" via customScheduled, which is the closest
+        equivalent, but Buffer may still place it in the next open
+        posting slot rather than sending it instantly. Verify actual
+        behavior against your account before relying on this for
+        time-sensitive posts.
+        """
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        return self.schedule_post(
+            channel_id, text, due_at=now_iso, metadata=metadata, image_url=image_url,
+        )
 
-        link = media.get("link")
-        description = media.get("description")
-        title = media.get("title")
-        photo = media.get("photo")
-        thumbnail = media.get("thumbnail")
+    def get_posts(self, organization_id, channel_id=None, first=20, after=None):
+        """List posts for an organization, optionally filtered by channel, with cursor pagination."""
+        query = """
+        query GetPosts($first: Int, $after: String, $input: PostsFilterInput!) {
+          posts(first: $first, after: $after, input: $input) {
+            edges {
+              node {
+                id
+                text
+                dueAt
+                status
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+        post_filter = {"organizationId": organization_id}
+        if channel_id:
+            post_filter["channelIds"] = [channel_id]
 
-        if link:
-            data["media[link]"] = link
-        if description:
-            data["media[description]"] = description
-        if title:
-            data["media[title]"] = title
-        if photo:
-            data["media[photo]"] = photo
-        if thumbnail:
-            data["media[thumbnail]"] = thumbnail
+        variables = {"first": first, "after": after, "input": post_filter}
+        data = self._request(query, variables=variables)
+        return data.get("posts", {})
+
+    def delete_post(self, post_id):
+        """
+        Delete a post by id.
+
+        The exact DeletePostInput shape isn't confirmed here - if this
+        errors with a schema validation message, check the current
+        DeletePostInput fields in the API Explorer at
+        https://developers.buffer.com and adjust the variables below.
+        """
+        if not post_id:
+            raise ValueError("post_id is required")
+
+        query = """
+        mutation DeletePost($input: DeletePostInput!) {
+          deletePost(input: $input) {
+            ... on DeletePostSuccess {
+              id
+            }
+            ... on MutationError {
+              message
+            }
+          }
+        }
+        """
+        data = self._request(query, variables={"input": {"id": post_id}})
+        return self._raise_if_mutation_error(
+            data, "deletePost", "Buffer did not return a delete result"
+        )

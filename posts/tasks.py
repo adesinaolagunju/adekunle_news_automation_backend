@@ -130,7 +130,7 @@ def process_buffer_job(job):
         raise ValueError("Buffer account not specified for job")
 
     news = job.news
-    service = BufferService(buffer_account.access_token)
+    service = BufferService(buffer_account.api_key)
     profiles_payload = service.get_profiles()
     profile_ids = _extract_buffer_profile_ids(profiles_payload)
 
