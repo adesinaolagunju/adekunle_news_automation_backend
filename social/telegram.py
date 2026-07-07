@@ -120,7 +120,6 @@ class TelegramPostFormatter:
 
 🔗 <a href="{link}">Read Full Story</a>
 
-Share your thoughts in the comments! 👇
 
 {hashtags}
             """

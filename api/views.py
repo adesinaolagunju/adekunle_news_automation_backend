@@ -1187,7 +1187,6 @@ class SystemSettingsView(APIView):
 Read More👇
 {link}
 
-Share your thoughts in the comments! 👇
 
 {hashtags}
                 """
@@ -1206,7 +1205,6 @@ Share your thoughts in the comments! 👇
 Read More👇
 {link}
 
-Share your thoughts in the comments! 👇
 
 {hashtags}
                 """

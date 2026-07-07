@@ -357,7 +357,6 @@ class SystemSettingsSerializer(serializers.Serializer):
 Read More👇
 {link}
 
-Share your thoughts in the comments! 👇
 
 {hashtags}
         """

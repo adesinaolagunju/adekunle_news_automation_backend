@@ -82,7 +82,6 @@ class BuildBufferMessageTest(TestCase):
             "Read More👇\n"
             "https://example.com\n"
             "\n"
-            "Share your thoughts in the comments! 👇\n"
             "\n"
             "#BreakingNews #Latest #Nigeria #PunchNG"
         )
@@ -101,7 +100,6 @@ class BuildBufferMessageTest(TestCase):
         self.assertNotIn("Test summary", result)
         self.assertIn("Read More👇", result)
         self.assertIn("https://example.com", result)
-        self.assertIn("Share your thoughts in the comments! 👇", result)
         self.assertIn("#BreakingNews #Latest #Ghana #BBC", result)
 
     def test_no_country_or_source_hashtags(self):

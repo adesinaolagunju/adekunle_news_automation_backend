@@ -330,7 +330,6 @@ def _build_buffer_message(news):
         "Read More👇",
         news.link,
         "",
-        "Share your thoughts in the comments! 👇",
         "",
         hashtags,
     ])
