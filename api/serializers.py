@@ -1,3 +1,5 @@
+# api/serializers.py
+
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from news.models import News, Category, Country, NewsFilterRule
@@ -354,6 +356,8 @@ class SystemSettingsSerializer(serializers.Serializer):
 
 Read More👇
 {link}
+
+Share your thoughts in the comments! 👇
 
 {hashtags}
         """

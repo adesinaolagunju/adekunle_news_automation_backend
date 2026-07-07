@@ -937,6 +937,8 @@ class SystemSettingsView(APIView):
 Read More👇
 {link}
 
+Share your thoughts in the comments! 👇
+
 {hashtags}
                 """
             }
@@ -953,6 +955,8 @@ Read More👇
 
 Read More👇
 {link}
+
+Share your thoughts in the comments! 👇
 
 {hashtags}
                 """

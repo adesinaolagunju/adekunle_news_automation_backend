@@ -12,10 +12,8 @@ Notes / caveats (as of this writing, the API is still in public beta):
 - "Profiles" are now called "channels".
 - Posts belong to a single channelId (no more posting to several
   profile_ids in one call) - loop and call create_post per channel.
-- There is no documented "publish immediately" mode. The two supported
-  modes are addToQueue (next open slot) and customScheduled (specific
-  dueAt). publish_now() below approximates "now" with customScheduled,
-  but confirm against the API Explorer if exact timing matters.
+- ``ShareMode`` enum includes ``shareNow`` for immediate publishing;
+  use ``publish_now()`` or pass ``mode="shareNow"`` directly.
 - Media is passed via `assets[{image:{url:...}}]` per the AssetInput schema
 - delete_post()/edit_post() field shapes aren't fully confirmed here -
   verify DeletePostInput / EditPostInput in the API Explorer
@@ -320,21 +318,18 @@ class BufferService:
     def publish_now(self, channel_id, text, metadata=None, image_url=None,
                      service=None):
         """
-        Best-effort 'publish immediately'.
+        Publish a post immediately via Buffer's ``shareNow`` mode.
 
-        The current beta GraphQL API has no documented immediate-publish
-        mode - only addToQueue and customScheduled. This schedules the
-        post for "now" via customScheduled, which is the closest
-        equivalent, but Buffer may still place it in the next open
-        posting slot rather than sending it instantly. Verify actual
-        behavior against your account before relying on this for
-        time-sensitive posts.
+        Buffer's GraphQL API accepts ``mode: shareNow`` on the
+        ``createPost`` mutation (see ``ShareMode`` enum at
+        https://developers.buffer.com/types/ShareMode.html).  The post
+        is sent to the social channel as soon as Buffer processes it,
+        bypassing the queue.
         """
-        from datetime import datetime, timezone
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        return self.schedule_post(
-            channel_id, text, due_at=now_iso, metadata=metadata,
-            image_url=image_url, service=service,
+        return self._create_post(
+            channel_id, text, mode="shareNow",
+            metadata=metadata, image_url=image_url,
+            service=service,
         )
 
     def get_posts(self, organization_id, channel_id=None, first=20, after=None):

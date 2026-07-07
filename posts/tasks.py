@@ -1,4 +1,6 @@
 # posts/tasks.py
+import re
+
 from celery import shared_task
 from django.db import models
 from django.utils import timezone
@@ -82,7 +84,7 @@ def process_telegram_job(job):
     service = TelegramService(telegram_channel.bot_token)
     
     # Format message
-    hashtags = telegram_channel.default_hashtags or "#News #BreakingNews"
+    hashtags = _build_hashtags(news)
     formatter = TelegramPostFormatter()
     message = formatter.format_message(news, hashtags=hashtags)
     
@@ -160,7 +162,7 @@ def process_buffer_job(job):
         display_name = channel.get('displayName') or channel.get('name', channel_id)
 
         try:
-            post_result = service.queue_post(
+            post_result = service.publish_now(
                 channel_id=channel_id,
                 text=message,
                 image_url=image_url,
@@ -203,14 +205,49 @@ def process_buffer_job(job):
     }
 
 
+def _build_hashtags(news):
+    """Generate a hashtag string from a News item's country and source.
+
+    Always includes ``#BreakingNews``, then the country (if present),
+    then the source (if present).  Non-alphanumeric characters are
+    stripped so every tag is a valid hashtag.
+    """
+    tags = ["#BreakingNews"]
+
+    if news.country:
+        clean = re.sub(r"[^a-zA-Z0-9]", "", news.country)
+        if clean:
+            tags.append(f"#{clean}")
+
+    if news.source:
+        clean = re.sub(r"[^a-zA-Z0-9]", "", news.source)
+        if clean:
+            tags.append(f"#{clean}")
+
+    return " ".join(tags)
+
+
 def _build_buffer_message(news):
     """Create a plain-text Buffer message."""
     summary = (news.summary or '').strip()
     if summary:
         summary = summary[:500]
-        return f"{news.title}\n\n{summary}\n\n{news.link}"
 
-    return f"{news.title}\n\n{news.link}"
+    hashtags = _build_hashtags(news)
+
+    parts = [f"📰 {news.title}"]
+    if summary:
+        parts.extend(["", summary])
+    parts.extend([
+        "",
+        "Read More👇",
+        news.link,
+        "",
+        "Share your thoughts in the comments! 👇",
+        "",
+        hashtags,
+    ])
+    return "\n".join(parts)
 
 
 def _extract_buffer_post_id(response):
