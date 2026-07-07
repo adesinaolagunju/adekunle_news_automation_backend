@@ -78,9 +78,8 @@ WSGI_APPLICATION = 'core.wsgi.application'
 # Database
 DATABASES = {
     "default": dj_database_url.config(
-        # First, check if DATABASE_URL is set in environment (e.g., from Docker)
         env="DATABASE_URL",
-        default="postgresql://adekunle:gOEgNARWMelB51tgX6D3t71TJUhmVkq0@dpg-d9304l6rnols7381mh00-a.oregon-postgres.render.com/adekunle",
+        default="postgresql://postgres.fvofpqzlpllsoshdjpkw:sulaimanadekunle@aws-0-eu-west-3.pooler.supabase.com:5432/postgres",
         conn_max_age=600,
         ssl_require=True,
     )
