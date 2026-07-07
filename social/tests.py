@@ -6,7 +6,7 @@ from django.test import TestCase
 from news.models import News
 from posts.models import PostJob
 from posts.tasks import process_buffer_job
-from social.buffer import BufferService
+from social.buffer import BufferService, _clear_cache
 from social.models import BufferAccount, SocialPlatform
 
 User = get_user_model()
@@ -69,7 +69,16 @@ class PublishNowDirectTest(TestCase):
 
 
 class ProcessBufferJobTest(TestCase):
-    """Tests for ``process_buffer_job()`` using mocked HTTP layer."""
+    """Tests for ``process_buffer_job()`` end-to-end through ``BufferService``."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        _clear_cache()
+
+    def setUp(self):
+        super().setUp()
+        _clear_cache()
 
     @classmethod
     def setUpTestData(cls):

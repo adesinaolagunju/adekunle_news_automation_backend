@@ -10,7 +10,7 @@ from django.db import models
 from django.utils import timezone
 from django.db import transaction
 from .models import PostJob, PostLog
-from social.buffer import BufferService
+from social.buffer import BufferService, BufferRateLimitError
 from social.telegram import TelegramService, TelegramPostFormatter
 from social.models import BufferAccount, TelegramChannel
 
@@ -58,20 +58,41 @@ def process_post_job(job_id):
         )
         
         return {"status": "success", "job_id": job.id}
-        
+
+    except BufferRateLimitError as e:
+        error_message = str(e)
+        job.mark_failed(error_message)
+        if e.retry_after:
+            job.next_retry_at = timezone.now() + timezone.timedelta(seconds=e.retry_after)
+            job.save()
+
+        PostLog.objects.create(
+            job=job,
+            action='rate_limited',
+            status=job.status,
+            message=f"{error_message[:200]}; retry_after={e.retry_after}"
+        )
+
+        return {
+            "status": "rate_limited",
+            "job_id": job.id,
+            "error": error_message,
+            "retry_after": e.retry_after,
+        }
+
     except Exception as e:
         error_message = str(e)
-        
+
         # Mark failed
         job.mark_failed(error_message)
-        
+
         PostLog.objects.create(
             job=job,
             action='failed',
             status=job.status,
             message=error_message[:500]
         )
-        
+
         return {"status": "failed", "job_id": job.id, "error": error_message}
 
 

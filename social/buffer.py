@@ -20,6 +20,9 @@ Notes / caveats (as of this writing, the API is still in public beta):
   (https://developers.buffer.com) before relying on them in production.
 """
 
+import time
+import threading
+
 import requests
 
 
@@ -33,6 +36,93 @@ class BufferAuthenticationError(BufferServiceError):
 
 class BufferAPIError(BufferServiceError):
     """Raised when Buffer returns a GraphQL-level error."""
+
+
+class BufferRateLimitError(BufferAPIError):
+    """Raised when Buffer responds with a rate-limit error.
+
+    ``retry_after`` is the number of seconds Buffer recommends waiting
+    before making the next request (parsed from the error extensions).
+    """
+
+    def __init__(self, message, retry_after=None):
+        self.retry_after = retry_after
+        super().__init__(message)
+
+
+# ---------------------------------------------------------------------------
+# Simple TTL cache for organisations and channels.
+# These are queried once per ``process_buffer_job`` but never change between
+# calls for the same API key, so caching them for a few minutes eliminates
+# 2 of the 5 API calls per repost.
+# ---------------------------------------------------------------------------
+_cache = {}
+_cache_lock = threading.Lock()
+_CACHE_TTL = 300  # 5 minutes
+
+
+def _cached(key, ttl=_CACHE_TTL):
+    """Return cached *key* if it exists and is still fresh, else ``None``."""
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and time.monotonic() < entry["expires"]:
+            return entry["value"]
+        return None
+
+
+def _set_cache(key, value, ttl=_CACHE_TTL):
+    """Store *value* under *key* with the given TTL."""
+    with _cache_lock:
+        _cache[key] = {"value": value, "expires": time.monotonic() + ttl}
+
+
+def _clear_cache():
+    """Drop all cached entries (useful in tests)."""
+    with _cache_lock:
+        _cache.clear()
+
+
+def _parse_retry_after(body):
+    """Extract ``retryAfter`` seconds from a Buffer error response body.
+
+    Returns ``None`` if the body doesn't contain a rate-limit error.
+    """
+    if not isinstance(body, dict):
+        return None
+    errors = body.get("errors")
+    if not isinstance(errors, list):
+        return None
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        ext = err.get("extensions") or {}
+        if ext.get("code") == "RATE_LIMIT_EXCEEDED":
+            return ext.get("retryAfter")
+    return None
+
+
+def _handle_rate_limit(response):
+    """Parse a 429 response and raise ``BufferRateLimitError``.
+
+    Buffer's 429 response carries the same GraphQL error body shape.
+    """
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise BufferRateLimitError(
+            "Buffer returned 429 with non-JSON body"
+        ) from exc
+
+    retry_after = _parse_retry_after(body)
+    message = "Too many requests from this client. Please try again later."
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+        message = errors[0].get("message", message)
+        code = (errors[0].get("extensions") or {}).get("code")
+        if code:
+            message = f"{message}; [code={code}]"
+
+    raise BufferRateLimitError(message, retry_after=retry_after)
 
 
 class BufferService:
@@ -70,6 +160,9 @@ class BufferService:
         except requests.RequestException as exc:
             raise BufferServiceError(f"Buffer request failed: {exc}") from exc
 
+        if response.status_code == 429:
+            _handle_rate_limit(response)
+
         if response.status_code in (401, 403):
             raise BufferAuthenticationError(
                 "Buffer rejected the API key (401/403). Regenerate it at "
@@ -87,6 +180,11 @@ class BufferService:
             message = self._extract_top_level_error(body) or (
                 f"Buffer API request failed with status {response.status_code}"
             )
+            # Check for rate limit in GraphQL error extensions (some 4xx responses
+            # carry the same error shape as 429).
+            retry_after = _parse_retry_after(body)
+            if retry_after is not None:
+                raise BufferRateLimitError(message, retry_after=retry_after)
             raise BufferAPIError(message)
 
         errors = body.get("errors")
@@ -97,6 +195,9 @@ class BufferService:
                 for err in errors
                 if isinstance(err, dict)
             }
+            if "RATE_LIMIT_EXCEEDED" in codes:
+                retry_after = _parse_retry_after(body)
+                raise BufferRateLimitError(message, retry_after=retry_after)
             if codes & {"UNAUTHORIZED", "FORBIDDEN"}:
                 raise BufferAuthenticationError(message)
             raise BufferAPIError(message)
@@ -201,12 +302,29 @@ class BufferService:
         return data.get("account")
 
     def get_organizations(self):
-        """Return the organizations available to this API key."""
+        """Return the organizations available to this API key.
+
+        Results are cached for 5 minutes since they never change during
+        a session.
+        """
+        api_key = self.api_key
+        cached = _cached(f"orgs:{api_key}")
+        if cached is not None:
+            return cached
         account = self.test_connection()
-        return (account or {}).get("organizations", [])
+        orgs = (account or {}).get("organizations", [])
+        _set_cache(f"orgs:{api_key}", orgs)
+        return orgs
 
     def get_channels(self, organization_id):
-        """Return channels (connected social profiles) for an organization."""
+        """Return channels (connected social profiles) for an organization.
+
+        Results are cached for 5 minutes per organization.
+        """
+        cache_key = f"channels:{organization_id}"
+        cached = _cached(cache_key)
+        if cached is not None:
+            return cached
         query = """
         query GetChannels($organizationId: OrganizationId!) {
           channels(input: { organizationId: $organizationId }) {
@@ -220,7 +338,9 @@ class BufferService:
         }
         """
         data = self._request(query, variables={"organizationId": organization_id})
-        return data.get("channels", [])
+        channels = data.get("channels", [])
+        _set_cache(cache_key, channels)
+        return channels
 
     def _create_post(self, channel_id, text, mode, due_at=None,
                       metadata=None, image_url=None, save_to_draft=False,
