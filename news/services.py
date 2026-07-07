@@ -8,7 +8,7 @@ from .models import News, NewsFilterRule
 class NewsFetcher:
     """Fetch news from Ubuntu Report API"""
     
-    API_URL = "https://ubuntureport.onrender.com/api/news/"
+    API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
     
     def __init__(self):
         self.session = requests.Session()

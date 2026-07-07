@@ -99,7 +99,7 @@ class FetchRecentEndpointTest(TestCase):
 
         mock_fetcher = MagicMock()
         mock_cls.return_value = mock_fetcher
-        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/"
+        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
         mock_fetcher.session.get.side_effect = self._mock_session_get(items_by_page)
         mock_fetcher.should_post_news.return_value = should_post
         return mock_fetcher
@@ -166,7 +166,7 @@ class FetchRecentEndpointTest(TestCase):
         from requests.exceptions import Timeout
 
         mock_fetcher = MagicMock()
-        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/"
+        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
         mock_fetcher.session.get.side_effect = Timeout("Connection timed out")
 
         patcher = patch("api.views.NewsFetcher", return_value=mock_fetcher)
@@ -179,7 +179,7 @@ class FetchRecentEndpointTest(TestCase):
 
     def test_upstream_bad_json(self):
         mock_fetcher = MagicMock()
-        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/"
+        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.side_effect = ValueError("No JSON")
         mock_fetcher.session.get.return_value = mock_resp
