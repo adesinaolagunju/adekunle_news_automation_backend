@@ -401,28 +401,25 @@ class NewsViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def fetch_recent(self, request):
         """
-        Fetch recent news (last 2 hours) synchronously and queue matching
-        items for posting.  Does not go through Celery for the fetch part,
-        only for the individual post jobs.
+        Fetch news from the upstream API synchronously, deduplicate
+        against existing News rows, and queue matching items for posting.
+
+        Does not go through Celery for the fetch part, only for the
+        individual post jobs.
 
         Returns a summary of what was fetched, saved, and queued.
         """
-        now = timezone.now()
-        cutoff = now - timedelta(hours=2)
-
         fetcher = NewsFetcher()
         url = fetcher.API_URL
 
         total_fetched = 0
         new_count = 0
         duplicate_count = 0
-        outside_window_count = 0
         queued_count = 0
         pages_fetched = 0
         max_pages = 10
-        early_stop = False
 
-        while url and pages_fetched < max_pages and not early_stop:
+        while url and pages_fetched < max_pages:
             try:
                 response = fetcher.session.get(url, timeout=30)
                 response.raise_for_status()
@@ -450,24 +447,7 @@ class NewsViewSet(viewsets.ModelViewSet):
             if not results:
                 break
 
-            page_all_old = True
-
             for item in results:
-                published_raw = (item.get("published") or "").replace("Z", "+00:00")
-                try:
-                    published = datetime.fromisoformat(published_raw)
-                except (ValueError, TypeError):
-                    published = None
-
-                if not published:
-                    continue
-
-                if published < cutoff:
-                    outside_window_count += 1
-                    continue
-
-                page_all_old = False
-
                 api_id = item.get("id")
                 if not api_id:
                     continue
@@ -511,19 +491,14 @@ class NewsViewSet(viewsets.ModelViewSet):
                                 )
                                 queued_count += 1
 
-            if page_all_old:
-                early_stop = True
-
             url = data.get("next")
 
         return Response({
             "fetched": total_fetched,
             "new": new_count,
             "duplicates": duplicate_count,
-            "outside_window": outside_window_count,
             "queued": queued_count,
             "pages_fetched": pages_fetched,
-            "early_stopped": early_stop,
         })
 
     @action(detail=False, methods=["post"])
