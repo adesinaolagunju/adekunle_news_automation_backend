@@ -11,6 +11,7 @@ from django.db import transaction
 from django.contrib.auth import authenticate, logout
 from datetime import datetime, timedelta
 from django_celery_beat.models import PeriodicTask, IntervalSchedule
+from rest_framework.permissions import AllowAny
 
 import requests
 
@@ -309,6 +310,11 @@ class NewsViewSet(viewsets.ModelViewSet):
     queryset = News.objects.all().order_by('-published')
     serializer_class = NewsSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action in ('fetch_recent', 'post_all'):
+            return [permissions.AllowAny()]
+        return super().get_permissions()
     
     def get_serializer_class(self):
         if self.action == 'retrieve':
