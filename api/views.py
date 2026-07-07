@@ -1,4 +1,5 @@
 # api/views.py
+import concurrent
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -502,24 +503,27 @@ class NewsViewSet(viewsets.ModelViewSet):
         })
 
     
+    import concurrent.futures
+
     @action(detail=False, methods=["post"])
     def post_all(self, request):
         """
         Find all news that have never been successfully posted and that
         don't already have pending/processing jobs, and post up to
-        `batch_size` of them immediately (no Celery).
-
-        Accepts an optional `batch_size` query/body param (default 5) to
-        control how many news items are posted per call.
-
-        Returns a summary of what was posted / failed / skipped, plus how
-        many eligible items remain for a follow-up call.
+        `batch_size` of them immediately (no Celery), processing jobs
+        concurrently to reduce wall-clock time.
         """
         try:
             batch_size = int(request.data.get("batch_size") or request.query_params.get("batch_size") or 5)
         except (TypeError, ValueError):
-            batch_size = 1
-        batch_size = max(1, min(batch_size, 100))  # sane bounds
+            batch_size = 5
+        batch_size = max(1, min(batch_size, 20))
+
+        try:
+            max_workers = int(request.data.get("max_workers") or request.query_params.get("max_workers") or 5)
+        except (TypeError, ValueError):
+            max_workers = 5
+        max_workers = max(1, min(max_workers, 10))
 
         successful_ids = PostJob.objects.filter(status="success").values("news_id")
         pending_ids_qs = PostJob.objects.filter(
@@ -534,11 +538,6 @@ class NewsViewSet(viewsets.ModelViewSet):
 
         total = base_qs.count()
 
-        # Pre-load platforms / channels / accounts once.
-        # Not filtered by `enabled` here — matches repost(), which posts
-        # through a connected Buffer account regardless of the
-        # SocialPlatform.enabled flag. Actual gating is done by whether
-        # there's a verified channel / connected account below.
         platforms = list(
             SocialPlatform.objects.filter(name__in=["telegram", "buffer"])
         )
@@ -549,7 +548,6 @@ class NewsViewSet(viewsets.ModelViewSet):
             BufferAccount.objects.filter(connection_status="connected").order_by("-updated_at")
         )
 
-        # Set of news IDs that have pending/processing jobs (safety check)
         pending_set = set(
             PostJob.objects.filter(status__in=["pending", "processing"])
             .values_list("news_id", flat=True)
@@ -557,10 +555,11 @@ class NewsViewSet(viewsets.ModelViewSet):
         )
 
         already_queued = 0
-        posted_count = 0
-        failed_count = 0
-        processed_count = 0  # news items actually attempted this call
+        processed_count = 0
+        jobs_to_process = []  # list of PostJob objects created, not yet processed
 
+        # Phase 1: pick news items for this batch and create their PostJob rows.
+        # Keep this part sequential (it's just fast DB writes).
         for news in base_qs.iterator():
             if processed_count >= batch_size:
                 break
@@ -580,11 +579,7 @@ class NewsViewSet(viewsets.ModelViewSet):
                             telegram_channel=channel,
                             status="pending",
                         )
-                        result = process_post_job(job.id)
-                        if result.get("status") == "success":
-                            posted_count += 1
-                        else:
-                            failed_count += 1
+                        jobs_to_process.append(job)
                 elif platform.name == "buffer":
                     for buffer_account in buffer_accounts:
                         job = PostJob.objects.create(
@@ -593,24 +588,44 @@ class NewsViewSet(viewsets.ModelViewSet):
                             buffer_account=buffer_account,
                             status="pending",
                         )
-                        result = process_post_job(job.id)
+                        jobs_to_process.append(job)
+
+        # Phase 2: process all created jobs concurrently — this is the slow,
+        # network-bound part, so running several at once is where the real
+        # time savings come from.
+        posted_count = 0
+        failed_count = 0
+
+        if jobs_to_process:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_job = {
+                    executor.submit(process_post_job, job.id): job
+                    for job in jobs_to_process
+                }
+                for future in concurrent.futures.as_completed(future_to_job):
+                    try:
+                        result = future.result()
                         if result.get("status") == "success":
                             posted_count += 1
                         else:
                             failed_count += 1
+                    except Exception:
+                        failed_count += 1
 
-        remaining = total - already_queued - processed_count
+        remaining = max(total - already_queued - processed_count, 0)
 
         return Response({
             "total": total,
             "batch_size": batch_size,
+            "max_workers": max_workers,
             "processed": processed_count,
             "already_queued": already_queued,
             "posted": posted_count,
             "failed": failed_count,
-            "remaining": max(remaining, 0),
+            "remaining": remaining,
         })
     
+
     @action(detail=True, methods=['post'])
     def repost(self, request, pk=None):
         """Repost a news article immediately (no Celery)."""
