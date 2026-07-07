@@ -518,7 +518,7 @@ class NewsViewSet(viewsets.ModelViewSet):
         try:
             batch_size = int(request.data.get("batch_size") or request.query_params.get("batch_size") or 5)
         except (TypeError, ValueError):
-            batch_size = 2
+            batch_size = 1
         batch_size = max(1, min(batch_size, 100))  # sane bounds
 
         successful_ids = PostJob.objects.filter(status="success").values("news_id")
