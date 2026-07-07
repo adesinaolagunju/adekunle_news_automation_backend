@@ -116,9 +116,18 @@ REST_FRAMEWORK = {
 
 # Static & Media
 STATIC_URL = 'static/'
+STATICFILES_DIRS = [BASE_DIR / 'static']
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 MEDIA_URL = 'media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# Default image fallback for news without a usable image
+SITE_DOMAIN = os.getenv('SITE_DOMAIN', 'localhost:8000')
+_scheme = 'http' if DEBUG else 'https'
+DEFAULT_NEWS_IMAGE_URL = os.getenv(
+    'DEFAULT_NEWS_IMAGE_URL',
+    f'{_scheme}://{SITE_DOMAIN}/static/images/default_new_image.png',
+)
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

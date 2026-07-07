@@ -27,39 +27,39 @@ class BuildHashtagsTest(TestCase):
 
     def test_country_and_source(self):
         news = _mock_news(country="Nigeria", source="PunchNG")
-        self.assertEqual(_build_hashtags(news), "#BreakingNews #Nigeria #PunchNG")
+        self.assertEqual(_build_hashtags(news), "#BreakingNews #Latest #Nigeria #PunchNG")
 
     def test_country_only(self):
         news = _mock_news(country="Ghana", source="")
-        self.assertEqual(_build_hashtags(news), "#BreakingNews #Ghana")
+        self.assertEqual(_build_hashtags(news), "#BreakingNews #Latest #Ghana")
 
     def test_source_only(self):
         news = _mock_news(country="", source="BBC News")
-        self.assertEqual(_build_hashtags(news), "#BreakingNews #BBCNews")
+        self.assertEqual(_build_hashtags(news), "#BreakingNews #Latest #BBCNews")
 
     def test_neither_country_nor_source(self):
         news = _mock_news(country="", source="")
-        self.assertEqual(_build_hashtags(news), "#BreakingNews")
+        self.assertEqual(_build_hashtags(news), "#BreakingNews #Latest")
 
     def test_multiple_word_country_strips_spaces(self):
         news = _mock_news(country="United States", source="TechCrunch")
-        self.assertEqual(_build_hashtags(news), "#BreakingNews #UnitedStates #TechCrunch")
+        self.assertEqual(_build_hashtags(news), "#BreakingNews #Latest #UnitedStates #TechCrunch")
 
     def test_special_characters_stripped(self):
         news = _mock_news(country="Côte d'Ivoire", source="O'Reilly Media")
         self.assertEqual(
             _build_hashtags(news),
-            "#BreakingNews #CtedIvoire #OReillyMedia",
+            "#BreakingNews #Latest #CtedIvoire #OReillyMedia",
         )
 
     def test_punctuation_only_value(self):
         """A country/source consisting entirely of punctuation should be skipped."""
         news = _mock_news(country="!!!", source="???")
-        self.assertEqual(_build_hashtags(news), "#BreakingNews")
+        self.assertEqual(_build_hashtags(news), "#BreakingNews #Latest")
 
     def test_none_country_or_source(self):
         news = _mock_news(country=None, source=None)
-        self.assertEqual(_build_hashtags(news), "#BreakingNews")
+        self.assertEqual(_build_hashtags(news), "#BreakingNews #Latest")
 
 
 class BuildBufferMessageTest(TestCase):
@@ -84,7 +84,7 @@ class BuildBufferMessageTest(TestCase):
             "\n"
             "Share your thoughts in the comments! 👇\n"
             "\n"
-            "#BreakingNews #Nigeria #PunchNG"
+            "#BreakingNews #Latest #Nigeria #PunchNG"
         )
         self.assertEqual(result, expected)
 
@@ -102,7 +102,7 @@ class BuildBufferMessageTest(TestCase):
         self.assertIn("Read More👇", result)
         self.assertIn("https://example.com", result)
         self.assertIn("Share your thoughts in the comments! 👇", result)
-        self.assertIn("#BreakingNews #Ghana #BBC", result)
+        self.assertIn("#BreakingNews #Latest #Ghana #BBC", result)
 
     def test_no_country_or_source_hashtags(self):
         news = _mock_news(
@@ -113,6 +113,6 @@ class BuildBufferMessageTest(TestCase):
             source="",
         )
         result = _build_buffer_message(news)
-        self.assertIn("#BreakingNews", result)
+        self.assertIn("#BreakingNews #Latest", result)
         self.assertNotIn("#None", result)
         self.assertNotIn("# ", result)

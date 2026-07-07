@@ -1,7 +1,11 @@
 # posts/tasks.py
 import re
+import urllib.parse
+
+import time
 
 from celery import shared_task
+from django.conf import settings
 from django.db import models
 from django.utils import timezone
 from django.db import transaction
@@ -88,17 +92,16 @@ def process_telegram_job(job):
     formatter = TelegramPostFormatter()
     message = formatter.format_message(news, hashtags=hashtags)
     
-    # Check if we should send with image
-    if news.image:
-        # Send with image
+    # Determine image to use (fall back to default if missing or malformed)
+    image_url = _resolve_news_image(news)
+    if image_url:
         response = service.send_photo(
             chat_id=telegram_channel.get_chat_id(),
-            photo=news.image,
+            photo=image_url,
             caption=message,
             parse_mode=telegram_channel.parse_mode
         )
     else:
-        # Send text only
         response = service.send_message(
             chat_id=telegram_channel.get_chat_id(),
             text=message,
@@ -150,8 +153,14 @@ def process_buffer_job(job):
     if not channels:
         raise ValueError("No Buffer channels available for the connected account")
 
+    def _proxy_image_url(url):
+        """Wrap an image URL through a public proxy so Buffer can reach it."""
+        if not url:
+            return None
+        return f"https://images.weserv.nl/?url={urllib.parse.quote(url, safe='')}"
+
     message = _build_buffer_message(news)
-    image_url = news.image if news.image else None
+    image_url = _resolve_news_image(news)
 
     succeeded = []
     failures = []
@@ -161,13 +170,19 @@ def process_buffer_job(job):
         service_name = channel.get('service', 'unknown')
         display_name = channel.get('displayName') or channel.get('name', channel_id)
 
-        try:
-            post_result = service.publish_now(
+        if succeeded or failures:
+            time.sleep(1)
+
+        def _try_post(url):
+            return service.publish_now(
                 channel_id=channel_id,
                 text=message,
-                image_url=image_url,
+                image_url=url,
                 service=service_name,
             )
+
+        try:
+            post_result = _try_post(image_url)
             succeeded.append({
                 'channel_id': channel_id,
                 'service': service_name,
@@ -175,6 +190,50 @@ def process_buffer_job(job):
                 'result': post_result,
             })
         except Exception as exc:
+            error_str = str(exc)
+            if image_url and ("Image URL" in error_str or "accessible" in error_str.lower() or "image dimension" in error_str.lower()):
+                # 1st retry: proxy the image URL through images.weserv.nl
+                proxied = _proxy_image_url(image_url)
+                try:
+                    post_result = _try_post(proxied)
+                    succeeded.append({
+                        'channel_id': channel_id,
+                        'service': service_name,
+                        'display_name': display_name,
+                        'result': post_result,
+                        'image_proxied': True,
+                    })
+                    continue
+                except Exception:
+                    pass
+                # 2nd retry: use the default fallback image
+                default_url = settings.DEFAULT_NEWS_IMAGE_URL
+                if default_url and default_url != image_url:
+                    try:
+                        post_result = _try_post(default_url)
+                        succeeded.append({
+                            'channel_id': channel_id,
+                            'service': service_name,
+                            'display_name': display_name,
+                            'result': post_result,
+                            'image_default': True,
+                        })
+                        continue
+                    except Exception:
+                        pass
+                # 3rd retry: skip image entirely
+                try:
+                    post_result = _try_post(None)
+                    succeeded.append({
+                        'channel_id': channel_id,
+                        'service': service_name,
+                        'display_name': display_name,
+                        'result': post_result,
+                        'image_skipped': True,
+                    })
+                    continue
+                except Exception:
+                    pass
             failures.append({
                 'channel_id': channel_id,
                 'service': service_name,
@@ -205,14 +264,21 @@ def process_buffer_job(job):
     }
 
 
+def _resolve_news_image(news):
+    raw = (news.image or '').strip()
+    if raw.startswith(('http://', 'https://')):
+        return raw
+    return settings.DEFAULT_NEWS_IMAGE_URL
+
+
 def _build_hashtags(news):
     """Generate a hashtag string from a News item's country and source.
 
-    Always includes ``#BreakingNews``, then the country (if present),
-    then the source (if present).  Non-alphanumeric characters are
-    stripped so every tag is a valid hashtag.
+    Always includes ``#BreakingNews`` and ``#Latest``, then the country
+    (if present), then the source (if present).  Non-alphanumeric
+    characters are stripped so every tag is a valid hashtag.
     """
-    tags = ["#BreakingNews"]
+    tags = ["#BreakingNews", "#Latest"]
 
     if news.country:
         clean = re.sub(r"[^a-zA-Z0-9]", "", news.country)

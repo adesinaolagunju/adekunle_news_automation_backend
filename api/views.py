@@ -11,7 +11,10 @@ from django.contrib.auth import authenticate, logout
 from datetime import datetime, timedelta
 from django_celery_beat.models import PeriodicTask, IntervalSchedule
 
+import requests
+
 from news.models import News, Category, Country, NewsFilterRule
+from news.services import NewsFetcher
 from social.models import BufferAccount, TelegramChannel, SocialPlatform
 from posts.models import PostJob, PostLog
 from posts.tasks import process_post_job
@@ -394,10 +397,274 @@ class NewsViewSet(viewsets.ModelViewSet):
             'task_id': result.id,
             'message': 'News fetch started'
         })
-    
+
+    @action(detail=False, methods=['post'])
+    def fetch_recent(self, request):
+        """
+        Fetch recent news (last 2 hours) synchronously and queue matching
+        items for posting.  Does not go through Celery for the fetch part,
+        only for the individual post jobs.
+
+        Returns a summary of what was fetched, saved, and queued.
+        """
+        now = timezone.now()
+        cutoff = now - timedelta(hours=2)
+
+        fetcher = NewsFetcher()
+        url = fetcher.API_URL
+
+        total_fetched = 0
+        new_count = 0
+        duplicate_count = 0
+        outside_window_count = 0
+        queued_count = 0
+        pages_fetched = 0
+        max_pages = 10
+        early_stop = False
+
+        while url and pages_fetched < max_pages and not early_stop:
+            try:
+                response = fetcher.session.get(url, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+            except requests.exceptions.Timeout:
+                return Response(
+                    {"error": "Upstream API timed out after 30s"},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+            except requests.exceptions.RequestException as exc:
+                return Response(
+                    {"error": f"Upstream API request failed: {exc}"},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+            except ValueError:
+                return Response(
+                    {"error": "Upstream API returned invalid JSON"},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+            pages_fetched += 1
+            results = data.get("results", [])
+            total_fetched += len(results)
+
+            if not results:
+                break
+
+            page_all_old = True
+
+            for item in results:
+                published_raw = (item.get("published") or "").replace("Z", "+00:00")
+                try:
+                    published = datetime.fromisoformat(published_raw)
+                except (ValueError, TypeError):
+                    published = None
+
+                if not published:
+                    continue
+
+                if published < cutoff:
+                    outside_window_count += 1
+                    continue
+
+                page_all_old = False
+
+                api_id = item.get("id")
+                if not api_id:
+                    continue
+
+                if News.objects.filter(api_news_id=api_id).exists():
+                    duplicate_count += 1
+                    continue
+
+                news = News.create_from_api(item)
+                new_count += 1
+
+                if fetcher.should_post_news(news):
+                    platforms = SocialPlatform.objects.filter(
+                        enabled=True,
+                        name__in=["telegram", "buffer"],
+                    )
+
+                    for platform in platforms:
+                        if platform.name == "telegram":
+                            channels = TelegramChannel.objects.filter(
+                                enabled=True, is_verified=True
+                            )
+                            for channel in channels:
+                                PostJob.objects.create(
+                                    news=news,
+                                    platform=platform,
+                                    telegram_channel=channel,
+                                    status="pending",
+                                )
+                                queued_count += 1
+                        elif platform.name == "buffer":
+                            buffer_accounts = BufferAccount.objects.filter(
+                                connection_status="connected"
+                            ).order_by("-updated_at")
+                            for buffer_account in buffer_accounts:
+                                PostJob.objects.create(
+                                    news=news,
+                                    platform=platform,
+                                    buffer_account=buffer_account,
+                                    status="pending",
+                                )
+                                queued_count += 1
+
+            if page_all_old:
+                early_stop = True
+
+            url = data.get("next")
+
+        return Response({
+            "fetched": total_fetched,
+            "new": new_count,
+            "duplicates": duplicate_count,
+            "outside_window": outside_window_count,
+            "queued": queued_count,
+            "pages_fetched": pages_fetched,
+            "early_stopped": early_stop,
+        })
+
+    @action(detail=False, methods=["post"])
+    def post_all(self, request):
+        """
+        Find all news that have never been successfully posted and that
+        don't already have pending/processing jobs, apply filter rules,
+        and post matching items immediately (no Celery).
+
+        Returns a summary of what was posted / failed / skipped.
+        """
+        successful_ids = PostJob.objects.filter(status="success").values("news_id")
+        pending_ids_qs = PostJob.objects.filter(
+            status__in=["pending", "processing"]
+        ).values("news_id")
+
+        base_qs = (
+            News.objects.exclude(id__in=successful_ids)
+            .exclude(id__in=pending_ids_qs)
+            .order_by("-published")
+        )
+
+        total = base_qs.count()
+
+        # Pre-load filter rules once (avoids N+1 queries)
+        rules = list(NewsFilterRule.objects.filter(enabled=True))
+
+        # Pre-load platforms / channels / accounts once
+        platforms = list(
+            SocialPlatform.objects.filter(enabled=True, name__in=["telegram", "buffer"])
+        )
+        telegram_channels = list(
+            TelegramChannel.objects.filter(enabled=True, is_verified=True)
+        )
+        buffer_accounts = list(
+            BufferAccount.objects.filter(connection_status="connected").order_by("-updated_at")
+        )
+
+        # Set of news IDs that have pending/processing jobs (safety check)
+        pending_set = set(
+            PostJob.objects.filter(status__in=["pending", "processing"])
+            .values_list("news_id", flat=True)
+            .distinct()
+        )
+
+        def _should_post(news):
+            """Inlined version of NewsFetcher.should_post_news using pre-loaded rules."""
+            for rule in rules:
+                value_lower = rule.value.lower()
+
+                if rule.rule_type == "category":
+                    match = news.category.lower() == value_lower
+                elif rule.rule_type == "country":
+                    match = (news.country or "").lower() == value_lower
+                elif rule.rule_type == "source":
+                    match = news.source.lower() == value_lower
+                elif rule.rule_type == "keyword":
+                    match = (
+                        value_lower in news.title.lower()
+                        or value_lower in (news.summary or "").lower()
+                    )
+                else:
+                    continue
+
+                if rule.rule_action == "exclude" and match:
+                    return False
+                if rule.rule_action == "include" and not match:
+                    return False
+
+            include_rules = [r for r in rules if r.rule_action == "include"]
+            if include_rules:
+                for rule in include_rules:
+                    value_lower = rule.value.lower()
+                    if rule.rule_type == "category" and news.category.lower() == value_lower:
+                        return True
+                    if (rule.rule_type == "country"
+                            and (news.country or "").lower() == value_lower):
+                        return True
+                    if rule.rule_type == "source" and news.source.lower() == value_lower:
+                        return True
+                    if rule.rule_type == "keyword":
+                        if (value_lower in news.title.lower()
+                                or value_lower in (news.summary or "").lower()):
+                            return True
+                return False
+
+            return True
+
+        filtered_out = 0
+        already_queued = 0
+        posted_count = 0
+        failed_count = 0
+
+        for news in base_qs.iterator():
+            if news.id in pending_set:
+                already_queued += 1
+                continue
+
+            if not _should_post(news):
+                filtered_out += 1
+                continue
+
+            for platform in platforms:
+                if platform.name == "telegram":
+                    for channel in telegram_channels:
+                        job = PostJob.objects.create(
+                            news=news,
+                            platform=platform,
+                            telegram_channel=channel,
+                            status="pending",
+                        )
+                        result = process_post_job(job.id)
+                        if result.get("status") == "success":
+                            posted_count += 1
+                        else:
+                            failed_count += 1
+                elif platform.name == "buffer":
+                    for buffer_account in buffer_accounts:
+                        job = PostJob.objects.create(
+                            news=news,
+                            platform=platform,
+                            buffer_account=buffer_account,
+                            status="pending",
+                        )
+                        result = process_post_job(job.id)
+                        if result.get("status") == "success":
+                            posted_count += 1
+                        else:
+                            failed_count += 1
+
+        return Response({
+            "total": total,
+            "already_queued": already_queued,
+            "filtered_out": filtered_out,
+            "posted": posted_count,
+            "failed": failed_count,
+        })
+
     @action(detail=True, methods=['post'])
     def repost(self, request, pk=None):
-        """Manually repost a news article via the authenticated user's Buffer account."""
+        """Repost a news article immediately (no Celery)."""
         news = self.get_object()
 
         buffer_account = BufferAccount.objects.filter(
@@ -424,12 +691,20 @@ class NewsViewSet(viewsets.ModelViewSet):
                 status='pending'
             )
 
-        process_post_job.delay(job.id)
+        result = process_post_job(job.id)
 
-        return Response({
-            'message': 'Repost job created and queued',
-            'job_id': job.id
-        })
+        if result.get('status') == 'success':
+            return Response({
+                'message': 'Reposted successfully',
+                'job_id': job.id,
+                'status': 'success',
+            })
+        else:
+            return Response({
+                'error': result.get('error', 'Repost failed'),
+                'job_id': job.id,
+                'status': 'failed',
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # ============ CATEGORY VIEWS ============

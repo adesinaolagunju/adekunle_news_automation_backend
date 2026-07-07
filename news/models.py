@@ -58,12 +58,15 @@ class News(models.Model):
     @classmethod
     def create_from_api(cls, api_data):
         """Create a News instance from API data"""
+        image = api_data.get('image')
+        if image is not None:
+            image = image.strip() or None
         return cls.objects.create(
             api_news_id=api_data['id'],
             title=api_data['title'],
             summary=api_data.get('summary', ''),
             link=api_data['link'],
-            image=api_data.get('image'),
+            image=image,
             published=api_data['published'],
             category=api_data.get('category', 'general'),
             country=api_data.get('country'),
