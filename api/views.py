@@ -501,15 +501,26 @@ class NewsViewSet(viewsets.ModelViewSet):
             "pages_fetched": pages_fetched,
         })
 
+    
     @action(detail=False, methods=["post"])
     def post_all(self, request):
         """
         Find all news that have never been successfully posted and that
-        don't already have pending/processing jobs, apply filter rules,
-        and post matching items immediately (no Celery).
+        don't already have pending/processing jobs, and post up to
+        `batch_size` of them immediately (no Celery).
 
-        Returns a summary of what was posted / failed / skipped.
+        Accepts an optional `batch_size` query/body param (default 5) to
+        control how many news items are posted per call.
+
+        Returns a summary of what was posted / failed / skipped, plus how
+        many eligible items remain for a follow-up call.
         """
+        try:
+            batch_size = int(request.data.get("batch_size") or request.query_params.get("batch_size") or 5)
+        except (TypeError, ValueError):
+            batch_size = 5
+        batch_size = max(1, min(batch_size, 100))  # sane bounds
+
         successful_ids = PostJob.objects.filter(status="success").values("news_id")
         pending_ids_qs = PostJob.objects.filter(
             status__in=["pending", "processing"]
@@ -523,12 +534,13 @@ class NewsViewSet(viewsets.ModelViewSet):
 
         total = base_qs.count()
 
-        # Pre-load filter rules once (avoids N+1 queries)
-        rules = list(NewsFilterRule.objects.filter(enabled=True))
-
-        # Pre-load platforms / channels / accounts once
+        # Pre-load platforms / channels / accounts once.
+        # Not filtered by `enabled` here — matches repost(), which posts
+        # through a connected Buffer account regardless of the
+        # SocialPlatform.enabled flag. Actual gating is done by whether
+        # there's a verified channel / connected account below.
         platforms = list(
-            SocialPlatform.objects.filter(enabled=True, name__in=["telegram", "buffer"])
+            SocialPlatform.objects.filter(name__in=["telegram", "buffer"])
         )
         telegram_channels = list(
             TelegramChannel.objects.filter(enabled=True, is_verified=True)
@@ -544,62 +556,20 @@ class NewsViewSet(viewsets.ModelViewSet):
             .distinct()
         )
 
-        def _should_post(news):
-            """Inlined version of NewsFetcher.should_post_news using pre-loaded rules."""
-            for rule in rules:
-                value_lower = rule.value.lower()
-
-                if rule.rule_type == "category":
-                    match = news.category.lower() == value_lower
-                elif rule.rule_type == "country":
-                    match = (news.country or "").lower() == value_lower
-                elif rule.rule_type == "source":
-                    match = news.source.lower() == value_lower
-                elif rule.rule_type == "keyword":
-                    match = (
-                        value_lower in news.title.lower()
-                        or value_lower in (news.summary or "").lower()
-                    )
-                else:
-                    continue
-
-                if rule.rule_action == "exclude" and match:
-                    return False
-                if rule.rule_action == "include" and not match:
-                    return False
-
-            include_rules = [r for r in rules if r.rule_action == "include"]
-            if include_rules:
-                for rule in include_rules:
-                    value_lower = rule.value.lower()
-                    if rule.rule_type == "category" and news.category.lower() == value_lower:
-                        return True
-                    if (rule.rule_type == "country"
-                            and (news.country or "").lower() == value_lower):
-                        return True
-                    if rule.rule_type == "source" and news.source.lower() == value_lower:
-                        return True
-                    if rule.rule_type == "keyword":
-                        if (value_lower in news.title.lower()
-                                or value_lower in (news.summary or "").lower()):
-                            return True
-                return False
-
-            return True
-
-        filtered_out = 0
         already_queued = 0
         posted_count = 0
         failed_count = 0
+        processed_count = 0  # news items actually attempted this call
 
         for news in base_qs.iterator():
+            if processed_count >= batch_size:
+                break
+
             if news.id in pending_set:
                 already_queued += 1
                 continue
 
-            if not _should_post(news):
-                filtered_out += 1
-                continue
+            processed_count += 1
 
             for platform in platforms:
                 if platform.name == "telegram":
@@ -629,14 +599,18 @@ class NewsViewSet(viewsets.ModelViewSet):
                         else:
                             failed_count += 1
 
+        remaining = total - already_queued - processed_count
+
         return Response({
             "total": total,
+            "batch_size": batch_size,
+            "processed": processed_count,
             "already_queued": already_queued,
-            "filtered_out": filtered_out,
             "posted": posted_count,
             "failed": failed_count,
+            "remaining": max(remaining, 0),
         })
-
+    
     @action(detail=True, methods=['post'])
     def repost(self, request, pk=None):
         """Repost a news article immediately (no Celery)."""
