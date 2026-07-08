@@ -519,7 +519,7 @@ class NewsViewSet(viewsets.ModelViewSet):
         `batch_size` of them immediately (no Celery), processing jobs
         concurrently to reduce wall-clock time.
 
-        Only considers news fetched within the last 45 minutes.
+        Only considers news fetched within the last 85 minutes.
         """
         try:
             batch_size = int(request.data.get("batch_size") or request.query_params.get("batch_size") or 5)
@@ -533,7 +533,7 @@ class NewsViewSet(viewsets.ModelViewSet):
             max_workers = 5
         max_workers = max(1, min(max_workers, 10))
 
-        cutoff = timezone.now() - timedelta(minutes=45)
+        cutoff = timezone.now() - timedelta(minutes=85)
 
         successful_ids = PostJob.objects.filter(status="success").values("news_id")
         pending_ids_qs = PostJob.objects.filter(
