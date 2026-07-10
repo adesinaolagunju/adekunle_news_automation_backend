@@ -11,8 +11,7 @@ from django.utils import timezone
 from django.db import transaction
 from .models import PostJob, PostLog
 from social.buffer import BufferService, BufferRateLimitError
-from social.telegram import TelegramService, TelegramPostFormatter
-from social.models import BufferAccount, TelegramChannel
+from social.models import BufferAccount
 
 @shared_task
 def process_post_job(job_id):
@@ -39,10 +38,7 @@ def process_post_job(job_id):
     )
     
     try:
-        # Process based on platform
-        if job.platform.name == 'telegram':
-            result = process_telegram_job(job)
-        elif job.platform.name == 'buffer':
+        if job.platform.name == 'buffer':
             result = process_buffer_job(job)
         else:
             raise ValueError(f"Unknown platform: {job.platform.name}")
@@ -94,53 +90,6 @@ def process_post_job(job_id):
         )
 
         return {"status": "failed", "job_id": job.id, "error": error_message}
-
-
-def process_telegram_job(job):
-    """Process a Telegram post job"""
-    
-    telegram_channel = job.telegram_channel
-    if not telegram_channel:
-        raise ValueError("Telegram channel not specified for job")
-    
-    news = job.news
-    
-    # Initialize Telegram service
-    service = TelegramService(telegram_channel.bot_token)
-    
-    # Format message
-    hashtags = _build_hashtags(news)
-    formatter = TelegramPostFormatter()
-    message = formatter.format_message(news, hashtags=hashtags)
-    
-    # Determine image to use (fall back to default if missing or malformed)
-    image_url = _resolve_news_image(news)
-    if image_url:
-        response = service.send_photo(
-            chat_id=telegram_channel.get_chat_id(),
-            photo=image_url,
-            caption=message,
-            parse_mode=telegram_channel.parse_mode
-        )
-    else:
-        response = service.send_message(
-            chat_id=telegram_channel.get_chat_id(),
-            text=message,
-            parse_mode=telegram_channel.parse_mode
-        )
-    
-    # Check response
-    if not response.get('ok'):
-        error = response.get('description', 'Unknown error')
-        raise Exception(f"Telegram API error: {error}")
-    
-    result = response.get('result', {})
-    message_id = result.get('message_id')
-    
-    return {
-        'response': response,
-        'message_id': str(message_id) if message_id else None
-    }
 
 
 def process_buffer_job(job):
@@ -293,13 +242,18 @@ def _resolve_news_image(news):
 
 
 def _build_hashtags(news):
-    """Generate a hashtag string from a News item's country and source.
+    """Generate a hashtag string from a News item's category, country, and source.
 
-    Always includes ``#BreakingNews`` and ``#Latest``, then the country
-    (if present), then the source (if present).  Non-alphanumeric
-    characters are stripped so every tag is a valid hashtag.
+    Always includes ``#BreakingNews`` and ``#Latest``, then the category
+    (if present), then the country (if present), then the source (if present).
+    Non-alphanumeric characters are stripped so every tag is a valid hashtag.
     """
     tags = ["#BreakingNews", "#Latest"]
+
+    if news.category:
+        clean = re.sub(r"[^a-zA-Z0-9]", "", news.category)
+        if clean:
+            tags.append(f"#{clean}")
 
     if news.country:
         clean = re.sub(r"[^a-zA-Z0-9]", "", news.country)

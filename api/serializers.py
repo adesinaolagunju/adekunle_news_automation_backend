@@ -28,13 +28,15 @@ class NewsSerializer(serializers.ModelSerializer):
     """Serializer for news articles"""
     
     posted_to = serializers.SerializerMethodField()
+    buffer_account_name = serializers.SerializerMethodField()
     
     class Meta:
         model = News
         fields = [
             'id', 'api_news_id', 'title', 'summary', 'link', 
             'image', 'published', 'category', 'country', 'source',
-            'fetched_at', 'is_processed', 'posted_to'
+            'fetched_at', 'is_processed', 'posted_to', 'buffer_account',
+            'buffer_account_name'
         ]
         read_only_fields = ['id', 'api_news_id', 'fetched_at']
     
@@ -43,6 +45,12 @@ class NewsSerializer(serializers.ModelSerializer):
         return list(obj.post_jobs.filter(
             status='success'
         ).values_list('platform__name', flat=True).distinct())
+    
+    def get_buffer_account_name(self, obj):
+        """Get the buffer account display name"""
+        if obj.buffer_account:
+            return obj.buffer_account.name or str(obj.buffer_account)
+        return None
 
 
 class NewsDetailSerializer(NewsSerializer):
@@ -137,6 +145,8 @@ class SocialPlatformSerializer(serializers.ModelSerializer):
 class BufferConnectSerializer(serializers.Serializer):
     """Serializer for connecting a Buffer account via a personal API key"""
     api_key = serializers.CharField(write_only=True)
+    name = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    api_url = serializers.URLField(max_length=500, required=True)
     token_expires_at = serializers.DateTimeField(required=False, allow_null=True)
 
     def validate_api_key(self, value):
@@ -149,17 +159,29 @@ class BufferConnectSerializer(serializers.Serializer):
 class BufferAccountStatusSerializer(serializers.ModelSerializer):
     """Serializer for Buffer account connection status"""
     connected = serializers.SerializerMethodField()
+    news_count = serializers.SerializerMethodField()
+    posted_count = serializers.SerializerMethodField()
 
     class Meta:
         model = BufferAccount
         fields = [
-            'id', 'connected', 'connection_status', 'token_expires_at',
+            'id', 'name', 'api_key', 'api_url', 'connected', 'connection_status',
+            'token_expires_at', 'news_count', 'posted_count',
             'created_at', 'updated_at'
         ]
-        read_only_fields = fields
+        read_only_fields = [
+            'id', 'connected', 'connection_status', 'token_expires_at',
+            'news_count', 'posted_count', 'created_at', 'updated_at'
+        ]
 
     def get_connected(self, obj):
         return obj.connection_status == 'connected'
+
+    def get_news_count(self, obj):
+        return obj.news_items.count()
+
+    def get_posted_count(self, obj):
+        return obj.news_items.filter(post_jobs__status='success').distinct().count()
 
 
 class BufferChannelSerializer(serializers.Serializer):

@@ -5,12 +5,14 @@ from django.utils import timezone
 from django.db import transaction
 from .models import News, NewsFilterRule
 
+DEFAULT_API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
+
+
 class NewsFetcher:
-    """Fetch news from Ubuntu Report API"""
+    """Fetch news from an upstream API"""
     
-    API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
-    
-    def __init__(self):
+    def __init__(self, api_url=None):
+        self.api_url = api_url or DEFAULT_API_URL
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'UbuntuNewsBot/1.0'
@@ -25,7 +27,7 @@ class NewsFetcher:
             max_pages: Maximum number of pages to fetch
         """
         all_news = []
-        url = self.API_URL
+        url = self.api_url
         pages_fetched = 0
         
         # Add time_frame filter
@@ -52,7 +54,7 @@ class NewsFetcher:
         
         return all_news
     
-    def process_news(self, news_list):
+    def process_news(self, news_list, buffer_account=None):
         """Process fetched news, save new ones"""
         saved_count = 0
         new_news = []
@@ -61,12 +63,15 @@ class NewsFetcher:
             for item in news_list:
                 api_id = item.get('id')
                 
-                # Check if news already exists
-                if News.objects.filter(api_news_id=api_id).exists():
+                # Check if news already exists for this account
+                if News.objects.filter(
+                    api_news_id=api_id,
+                    buffer_account=buffer_account
+                ).exists():
                     continue
                 
                 # Create new news
-                news = News.create_from_api(item)
+                news = News.create_from_api(item, buffer_account=buffer_account)
                 new_news.append(news)
                 saved_count += 1
         

@@ -35,6 +35,8 @@ urlpatterns = [
     path('buffer/channels/', BufferChannelsView.as_view(), name='buffer-channels'),
     path('buffer/disconnect/', BufferDisconnectView.as_view(), name='buffer-disconnect'),
     path('buffer/test/', BufferTestView.as_view(), name='buffer-test'),
+    path('buffer/accounts/', BufferAccountListView.as_view(), name='buffer-accounts'),
+    path('buffer/accounts/<int:pk>/', BufferAccountUpdateView.as_view(), name='buffer-account-update'),
     
     # Include router URLs
     path('', include(router.urls)),

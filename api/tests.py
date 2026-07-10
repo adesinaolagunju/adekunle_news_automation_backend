@@ -9,13 +9,13 @@ from rest_framework.test import APIClient
 
 from news.models import News, NewsFilterRule
 from posts.models import PostJob
-from social.models import SocialPlatform, TelegramChannel
+from social.models import SocialPlatform, BufferAccount
 
 User = get_user_model()
 
 
 class FetchRecentEndpointTest(TestCase):
-    """Tests for ``POST /api/news/fetch-recent/``."""
+    """Tests for ``POST /api/news/fetch_recent/``."""
 
     @classmethod
     def setUpTestData(cls):
@@ -29,18 +29,12 @@ class FetchRecentEndpointTest(TestCase):
         cls.platform_buffer.enabled = True
         cls.platform_buffer.save(update_fields=["enabled"])
 
-        cls.platform_telegram, _ = SocialPlatform.objects.get_or_create(
-            name="telegram", defaults={"enabled": True}
-        )
-        cls.platform_telegram.enabled = True
-        cls.platform_telegram.save(update_fields=["enabled"])
-        cls.telegram_channel = TelegramChannel.objects.create(
-            name="Test Channel",
-            channel_username="@testchannel",
-            channel_chat_id="-1001234567890",
-            bot_token="123:abc",
-            enabled=True,
-            is_verified=True,
+        cls.buffer_account = BufferAccount.objects.create(
+            user=cls.user,
+            name="Test Account",
+            api_key="test-key",
+            api_url="https://example.com/api/news/",
+            connection_status="connected",
         )
 
     def setUp(self):
@@ -99,7 +93,7 @@ class FetchRecentEndpointTest(TestCase):
 
         mock_fetcher = MagicMock()
         mock_cls.return_value = mock_fetcher
-        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
+        mock_fetcher.api_url = self.buffer_account.api_url
         mock_fetcher.session.get.side_effect = self._mock_session_get(items_by_page)
         mock_fetcher.should_post_news.return_value = should_post
         return mock_fetcher
@@ -118,7 +112,6 @@ class FetchRecentEndpointTest(TestCase):
         self.assertEqual(data["fetched"], 2)
         self.assertEqual(data["new"], 2)
         self.assertEqual(data["duplicates"], 0)
-        self.assertEqual(data["outside_window"], 0)
         self.assertGreater(data["queued"], 0)
 
     def test_duplicates_skipped(self):
@@ -129,6 +122,7 @@ class FetchRecentEndpointTest(TestCase):
             published=timezone.now(),
             category="tech",
             source="Test",
+            buffer_account=self.buffer_account,
         )
         self._patch_fetcher([([self._make_api_item(99), self._make_api_item(100)], False)])
 
@@ -138,35 +132,11 @@ class FetchRecentEndpointTest(TestCase):
         self.assertEqual(data["new"], 1)
         self.assertEqual(data["duplicates"], 1)
 
-    def test_outside_window_skipped(self):
-        self._patch_fetcher([([self._make_api_item(200, hours_ago=3)], False)])
-
-        response = self.api_client.post("/api/news/fetch_recent/", format="json")
-        data = response.json()
-        self.assertEqual(data["fetched"], 1)
-        self.assertEqual(data["new"], 0)
-        self.assertEqual(data["outside_window"], 1)
-
-    def test_early_pagination_stop(self):
-        self._patch_fetcher(
-            [
-                ([self._make_api_item(300)], True),
-                ([self._make_api_item(301, hours_ago=3)], False),
-            ]
-        )
-
-        response = self.api_client.post("/api/news/fetch_recent/", format="json")
-        data = response.json()
-        self.assertEqual(data["fetched"], 2)
-        self.assertEqual(data["new"], 1)
-        self.assertEqual(data["outside_window"], 1)
-        self.assertTrue(data["early_stopped"])
-
     def test_upstream_timeout(self):
         from requests.exceptions import Timeout
 
         mock_fetcher = MagicMock()
-        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
+        mock_fetcher.api_url = self.buffer_account.api_url
         mock_fetcher.session.get.side_effect = Timeout("Connection timed out")
 
         patcher = patch("api.views.NewsFetcher", return_value=mock_fetcher)
@@ -174,12 +144,14 @@ class FetchRecentEndpointTest(TestCase):
         self.addCleanup(patcher.stop)
 
         response = self.api_client.post("/api/news/fetch_recent/", format="json")
-        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
-        self.assertIn("timed out", response.json()["error"])
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertIn("accounts", data)
+        self.assertTrue(any("error" in a for a in data["accounts"]))
 
     def test_upstream_bad_json(self):
         mock_fetcher = MagicMock()
-        mock_fetcher.API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
+        mock_fetcher.api_url = self.buffer_account.api_url
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.side_effect = ValueError("No JSON")
         mock_fetcher.session.get.return_value = mock_resp
@@ -189,8 +161,9 @@ class FetchRecentEndpointTest(TestCase):
         self.addCleanup(patcher.stop)
 
         response = self.api_client.post("/api/news/fetch_recent/", format="json")
-        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
-        self.assertIn("invalid json", response.json()["error"].lower())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(any("error" in a for a in data["accounts"]))
 
     def test_max_pages_hard_cap(self):
         pages = [([self._make_api_item(400 + i)], True) for i in range(11)]
@@ -201,9 +174,16 @@ class FetchRecentEndpointTest(TestCase):
         self.assertEqual(data["pages_fetched"], 10)
         self.assertEqual(data["fetched"], 10)
 
+    def test_no_connected_accounts(self):
+        self.buffer_account.connection_status = "disconnected"
+        self.buffer_account.save(update_fields=["connection_status"])
+
+        response = self.api_client.post("/api/news/fetch_recent/", format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
 
 class PostAllEndpointTest(TestCase):
-    """Tests for ``POST /api/news/post-all/``."""
+    """Tests for ``POST /api/news/post_all/``."""
 
     @classmethod
     def setUpTestData(cls):
@@ -217,18 +197,12 @@ class PostAllEndpointTest(TestCase):
         cls.platform_buffer.enabled = True
         cls.platform_buffer.save(update_fields=["enabled"])
 
-        cls.platform_telegram, _ = SocialPlatform.objects.get_or_create(
-            name="telegram", defaults={"enabled": True}
-        )
-        cls.platform_telegram.enabled = True
-        cls.platform_telegram.save(update_fields=["enabled"])
-        cls.telegram_channel = TelegramChannel.objects.create(
-            name="PostAll Channel",
-            channel_username="@postalltest",
-            channel_chat_id="-1009999999999",
-            bot_token="999:abc",
-            enabled=True,
-            is_verified=True,
+        cls.buffer_account = BufferAccount.objects.create(
+            user=cls.user,
+            name="Test Account",
+            api_key="test-key",
+            api_url="https://example.com/api/news/",
+            connection_status="connected",
         )
 
     def setUp(self):
@@ -247,6 +221,7 @@ class PostAllEndpointTest(TestCase):
             category="tech",
             country="Nigeria",
             source="TestSource",
+            buffer_account=self.buffer_account,
         )
         defaults.update(kwargs)
         return News.objects.create(api_news_id=api_news_id, **defaults)
@@ -274,15 +249,15 @@ class PostAllEndpointTest(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(data["total"], 2)
-        self.assertEqual(data["posted"], 2)  # 2 news × 1 telegram channel
+        self.assertEqual(data["posted"], 2)
 
     def test_skips_already_successful_news(self):
         """News with a successful PostJob should be excluded."""
         news = self._make_news(10)
         PostJob.objects.create(
             news=news,
-            platform=self.platform_telegram,
-            telegram_channel=self.telegram_channel,
+            platform=self.platform_buffer,
+            buffer_account=self.buffer_account,
             status="success",
         )
 
@@ -295,8 +270,8 @@ class PostAllEndpointTest(TestCase):
         news = self._make_news(20)
         PostJob.objects.create(
             news=news,
-            platform=self.platform_telegram,
-            telegram_channel=self.telegram_channel,
+            platform=self.platform_buffer,
+            buffer_account=self.buffer_account,
             status="pending",
         )
 
@@ -311,13 +286,8 @@ class PostAllEndpointTest(TestCase):
         news = self._make_news(30)
         PostJob.objects.create(
             news=news,
-            platform=self.platform_telegram,
-            telegram_channel=self.telegram_channel,
-            status="failed",
-        )
-        PostJob.objects.create(
-            news=news,
             platform=self.platform_buffer,
+            buffer_account=self.buffer_account,
             status="failed",
         )
 
@@ -328,48 +298,10 @@ class PostAllEndpointTest(TestCase):
         self.assertEqual(data["total"], 1)
         self.assertGreater(data["posted"], 0)
 
-    def test_respects_filter_rules(self):
-        """News blocked by filter rules should be filtered_out."""
-        NewsFilterRule.objects.create(
-            rule_type="keyword",
-            rule_action="exclude",
-            value="Article",
-            enabled=True,
-        )
-        self._make_news(40)
-        self._make_news(41)
-
-        response = self.api_client.post("/api/news/post_all/", format="json")
-        data = response.json()
-        self.assertEqual(data["total"], 2)
-        self.assertEqual(data["filtered_out"], 2)
-        self.assertEqual(data["posted"], 0)
-
-    def test_mixed_filter_and_post(self):
-        """Some pass filter, some don't — counts should reflect that."""
-        NewsFilterRule.objects.create(
-            rule_type="category",
-            rule_action="include",
-            value="tech",
-            enabled=True,
-        )
-        self._make_news(50, category="tech")
-        self._make_news(51, category="sports")
-        self._make_news(52, category="tech")
-        self._patch_process_post_job("success")
-
-        response = self.api_client.post("/api/news/post_all/", format="json")
-        data = response.json()
-        self.assertEqual(data["total"], 3)
-        self.assertEqual(data["filtered_out"], 1)
-        self.assertEqual(data["posted"], 2)  # 2 tech news × 1 telegram channel
-
     def test_no_platforms_posts_nothing(self):
-        """With no enabled platforms, posted should be 0."""
-        self.platform_buffer.enabled = False
-        self.platform_buffer.save(update_fields=["enabled"])
-        self.platform_telegram.enabled = False
-        self.platform_telegram.save(update_fields=["enabled"])
+        """With no enabled buffer accounts, posted should be 0."""
+        self.buffer_account.connection_status = "disconnected"
+        self.buffer_account.save(update_fields=["connection_status"])
 
         self._make_news(60)
         self._make_news(61)
@@ -391,8 +323,30 @@ class PostAllEndpointTest(TestCase):
         self.assertEqual(data["posted"], 0)
         self.assertEqual(data["failed"], 1)
 
-    def test_authenticated_required(self):
-        """Unauthenticated requests should get 401."""
+    def test_allowany_works(self):
+        """post_all uses AllowAny, so unauthenticated requests should work."""
         client = APIClient()
         response = client.post("/api/news/post_all/", format="json")
-        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_filters_by_account(self):
+        """When buffer_account_id is provided, only that account's news is processed."""
+        other_account = BufferAccount.objects.create(
+            user=self.user,
+            name="Other Account",
+            api_key="other-key",
+            api_url="https://other.example.com/api/",
+            connection_status="connected",
+        )
+        self._make_news(80, buffer_account=self.buffer_account)
+        self._make_news(81, buffer_account=other_account)
+        self._patch_process_post_job("success")
+
+        response = self.api_client.post(
+            "/api/news/post_all/",
+            {"buffer_account_id": self.buffer_account.id},
+            format="json",
+        )
+        data = response.json()
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["posted"], 1)

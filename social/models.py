@@ -133,7 +133,18 @@ class BufferAccount(models.Model):
         on_delete=models.CASCADE,
         related_name='buffer_accounts'
     )
+    name = models.CharField(
+        max_length=200,
+        blank=True,
+        default='',
+        help_text="Display name for this account (shown in sidebar)"
+    )
     api_key = EncryptedTextField()
+    api_url = models.URLField(
+        max_length=500,
+        default='https://ubuntureport.onrender.com/api/news/top-sources-recent/',
+        help_text="Upstream API URL to fetch news from for this account"
+    )
     token_expires_at = models.DateTimeField(blank=True, null=True)
     connection_status = models.CharField(
         max_length=20,
@@ -151,4 +162,4 @@ class BufferAccount(models.Model):
         ]
 
     def __str__(self):
-        return f"Buffer account for {self.user}"
+        return self.name or f"Buffer account for {self.user}"

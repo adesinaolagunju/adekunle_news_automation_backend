@@ -29,7 +29,7 @@ class Country(models.Model):
 
 class News(models.Model):
     # API data
-    api_news_id = models.IntegerField(unique=True, db_index=True)
+    api_news_id = models.IntegerField(db_index=True)
     title = models.TextField()
     summary = models.TextField(blank=True)
     link = models.URLField(max_length=500)
@@ -41,12 +41,21 @@ class News(models.Model):
     country = models.CharField(max_length=100, blank=True, null=True, db_index=True)
     source = models.CharField(max_length=100, db_index=True)
     
+    # Account association
+    buffer_account = models.ForeignKey(
+        'social.BufferAccount',
+        on_delete=models.CASCADE,
+        null=True, blank=True,
+        related_name='news_items'
+    )
+    
     # Local tracking
     fetched_at = models.DateTimeField(auto_now_add=True)
     is_processed = models.BooleanField(default=False, db_index=True)
     
     class Meta:
         ordering = ['-published']
+        unique_together = [('buffer_account', 'api_news_id')]
         indexes = [
             models.Index(fields=['category', 'source']),
             models.Index(fields=['published', 'api_news_id']),
@@ -56,7 +65,7 @@ class News(models.Model):
         return self.title[:100]
     
     @classmethod
-    def create_from_api(cls, api_data):
+    def create_from_api(cls, api_data, buffer_account=None):
         """Create a News instance from API data"""
         image = api_data.get('image')
         if image is not None:
@@ -71,6 +80,7 @@ class News(models.Model):
             category=api_data.get('category', 'general'),
             country=api_data.get('country'),
             source=api_data.get('source', 'Unknown'),
+            buffer_account=buffer_account,
         )
 
 class NewsFilterRule(models.Model):

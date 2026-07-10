@@ -116,11 +116,22 @@ class BufferConnectView(BufferAPIView):
         except BufferServiceError as error:
             self.raise_buffer_error(error)
 
-        account = self.get_buffer_account()
-        if account is None:
+        # Check if an account with this API key already exists for this user
+        existing = BufferAccount.objects.filter(
+            user=request.user,
+            api_key=data['api_key']
+        ).first()
+
+        if existing:
+            # Update existing account
+            account = existing
+        else:
+            # Create a new account
             account = BufferAccount(user=request.user)
 
         account.api_key = data['api_key']
+        account.name = data.get('name', '')
+        account.api_url = data['api_url']
         account.token_expires_at = data.get('token_expires_at')
         account.connection_status = 'connected'
         account.save()
@@ -270,6 +281,49 @@ class BufferTestView(BufferAPIView):
         })
 
 
+class BufferAccountListView(BufferAPIView):
+    """List all Buffer accounts for the current user with news/post counts."""
+
+    @extend_schema(
+        summary="List Buffer accounts",
+        description="List all Buffer accounts for the authenticated user with news and post counts.",
+        responses={200: BufferAccountStatusSerializer(many=True)}
+    )
+    def get(self, request):
+        accounts = BufferAccount.objects.filter(
+            user=request.user
+        ).order_by('-created_at')
+        serializer = BufferAccountStatusSerializer(accounts, many=True)
+        return Response(serializer.data)
+
+
+class BufferAccountUpdateView(BufferAPIView):
+    """Update a Buffer account's name or api_url."""
+
+    @extend_schema(
+        summary="Update Buffer account",
+        description="Update a Buffer account's display name or API URL.",
+        request=BufferAccountStatusSerializer,
+        responses={200: BufferAccountStatusSerializer}
+    )
+    def patch(self, request, pk=None):
+        try:
+            account = BufferAccount.objects.get(id=pk, user=request.user)
+        except BufferAccount.DoesNotExist:
+            return Response(
+                {'error': 'Account not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if 'name' in request.data:
+            account.name = request.data['name']
+        if 'api_url' in request.data:
+            account.api_url = request.data['api_url']
+        account.save()
+
+        return Response(BufferAccountStatusSerializer(account).data)
+
+
 # ============ NEWS VIEWS ============
 
 @extend_schema_view(
@@ -323,6 +377,11 @@ class NewsViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         queryset = super().get_queryset()
+        
+        # Filter by buffer account
+        buffer_account_id = self.request.query_params.get('buffer_account')
+        if buffer_account_id:
+            queryset = queryset.filter(buffer_account_id=buffer_account_id)
         
         # Filter by category
         category = self.request.query_params.get('category')
@@ -408,104 +467,130 @@ class NewsViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def fetch_recent(self, request):
         """
-        Fetch news from the upstream API synchronously, deduplicate
-        against existing News rows, and queue matching items for posting.
+        Fetch news from each connected BufferAccount's API URL synchronously,
+        deduplicate against existing News rows per account, and queue
+        matching items for posting to that account's Buffer.
 
-        Does not go through Celery for the fetch part, only for the
-        individual post jobs.
-
-        Returns a summary of what was fetched, saved, and queued.
+        Returns a summary of what was fetched, saved, and queued per account.
         """
-        fetcher = NewsFetcher()
-        url = fetcher.API_URL
+        accounts = BufferAccount.objects.filter(
+            connection_status='connected'
+        ).order_by('-updated_at')
 
+        if not accounts.exists():
+            return Response(
+                {"error": "No connected Buffer accounts found"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        accounts_processed = 0
         total_fetched = 0
-        new_count = 0
-        duplicate_count = 0
-        queued_count = 0
-        pages_fetched = 0
-        max_pages = 10
+        total_new = 0
+        total_duplicates = 0
+        total_queued = 0
+        total_pages = 0
+        account_results = []
 
-        while url and pages_fetched < max_pages:
-            try:
-                response = fetcher.session.get(url, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-            except requests.exceptions.Timeout:
-                return Response(
-                    {"error": "Upstream API timed out after 30s"},
-                    status=status.HTTP_502_BAD_GATEWAY,
-                )
-            except requests.exceptions.RequestException as exc:
-                return Response(
-                    {"error": f"Upstream API request failed: {exc}"},
-                    status=status.HTTP_502_BAD_GATEWAY,
-                )
-            except ValueError:
-                return Response(
-                    {"error": "Upstream API returned invalid JSON"},
-                    status=status.HTTP_502_BAD_GATEWAY,
-                )
+        for account in accounts:
+            fetcher = NewsFetcher(api_url=account.api_url)
+            url = fetcher.api_url
 
-            pages_fetched += 1
-            results = data.get("results", [])
-            total_fetched += len(results)
+            acct_fetched = 0
+            acct_new = 0
+            acct_duplicates = 0
+            acct_queued = 0
+            acct_pages = 0
+            max_pages = 10
 
-            if not results:
-                break
+            while url and acct_pages < max_pages:
+                try:
+                    response = fetcher.session.get(url, timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                except requests.exceptions.Timeout:
+                    account_results.append({
+                        'account_id': account.id,
+                        'account_name': account.name,
+                        'error': 'Upstream API timed out after 30s',
+                    })
+                    break
+                except requests.exceptions.RequestException as exc:
+                    account_results.append({
+                        'account_id': account.id,
+                        'account_name': account.name,
+                        'error': f'Upstream API request failed: {exc}',
+                    })
+                    break
+                except ValueError:
+                    account_results.append({
+                        'account_id': account.id,
+                        'account_name': account.name,
+                        'error': 'Upstream API returned invalid JSON',
+                    })
+                    break
 
-            for item in results:
-                api_id = item.get("id")
-                if not api_id:
-                    continue
+                acct_pages += 1
+                results = data.get("results", [])
+                acct_fetched += len(results)
 
-                if News.objects.filter(api_news_id=api_id).exists():
-                    duplicate_count += 1
-                    continue
+                if not results:
+                    break
 
-                news = News.create_from_api(item)
-                new_count += 1
+                for item in results:
+                    api_id = item.get("id")
+                    if not api_id:
+                        continue
 
-                if fetcher.should_post_news(news):
-                    platforms = SocialPlatform.objects.filter(
-                        enabled=True,
-                        name__in=["telegram", "buffer"],
-                    )
+                    if News.objects.filter(
+                        api_news_id=api_id,
+                        buffer_account=account
+                    ).exists():
+                        acct_duplicates += 1
+                        continue
 
-                    for platform in platforms:
-                        if platform.name == "telegram":
-                            channels = TelegramChannel.objects.filter(
-                                enabled=True, is_verified=True
-                            )
-                            for channel in channels:
-                                PostJob.objects.create(
-                                    news=news,
-                                    platform=platform,
-                                    telegram_channel=channel,
-                                    status="pending",
-                                )
-                                queued_count += 1
-                        elif platform.name == "buffer":
-                            buffer_accounts = BufferAccount.objects.filter(
-                                connection_status="connected"
-                            ).order_by("-updated_at")
-                            for buffer_account in buffer_accounts:
-                                PostJob.objects.create(
-                                    news=news,
-                                    platform=platform,
-                                    buffer_account=buffer_account,
-                                    status="pending",
-                                )
-                                queued_count += 1
+                    news = News.create_from_api(item, buffer_account=account)
+                    acct_new += 1
 
-            url = data.get("next")
+                    if fetcher.should_post_news(news):
+                        platform, _ = SocialPlatform.objects.get_or_create(
+                            name='buffer',
+                            defaults={'enabled': False},
+                        )
+                        PostJob.objects.create(
+                            news=news,
+                            platform=platform,
+                            buffer_account=account,
+                            status="pending",
+                        )
+                        acct_queued += 1
+
+                url = data.get("next")
+
+            account_results.append({
+                'account_id': account.id,
+                'account_name': account.name,
+                'fetched': acct_fetched,
+                'new': acct_new,
+                'duplicates': acct_duplicates,
+                'queued': acct_queued,
+                'pages_fetched': acct_pages,
+            })
+
+            total_fetched += acct_fetched
+            total_new += acct_new
+            total_duplicates += acct_duplicates
+            total_queued += acct_queued
+            total_pages += acct_pages
+            accounts_processed += 1
 
         return Response({
+            "accounts_processed": accounts_processed,
             "fetched": total_fetched,
-            "new": new_count,
-            "duplicates": duplicate_count,
-            "queued": queued_count,
-            "pages_fetched": pages_fetched,
+            "new": total_new,
+            "duplicates": total_duplicates,
+            "queued": total_queued,
+            "pages_fetched": total_pages,
+            "accounts": account_results,
         })
 
     
@@ -520,6 +605,7 @@ class NewsViewSet(viewsets.ModelViewSet):
         concurrently to reduce wall-clock time.
 
         Only considers news fetched within the last 85 minutes.
+        Optionally filter by buffer_account_id.
         """
         try:
             batch_size = int(request.data.get("batch_size") or request.query_params.get("batch_size") or 5)
@@ -532,6 +618,9 @@ class NewsViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             max_workers = 5
         max_workers = max(1, min(max_workers, 10))
+
+        # Optional account filter
+        buffer_account_id = request.data.get("buffer_account_id") or request.query_params.get("buffer_account_id")
 
         cutoff = timezone.now() - timedelta(minutes=85)
 
@@ -547,16 +636,13 @@ class NewsViewSet(viewsets.ModelViewSet):
             .order_by("-published")
         )
 
+        if buffer_account_id:
+            base_qs = base_qs.filter(buffer_account_id=buffer_account_id)
+
         total = base_qs.count()
 
-        platforms = list(
-            SocialPlatform.objects.filter(name__in=["telegram", "buffer"])
-        )
-        telegram_channels = list(
-            TelegramChannel.objects.filter(enabled=True, is_verified=True)
-        )
-        buffer_accounts = list(
-            BufferAccount.objects.filter(connection_status="connected").order_by("-updated_at")
+        buffer_platform, _ = SocialPlatform.objects.get_or_create(
+            name='buffer', defaults={'enabled': False}
         )
 
         pending_set = set(
@@ -567,10 +653,9 @@ class NewsViewSet(viewsets.ModelViewSet):
 
         already_queued = 0
         processed_count = 0
-        jobs_to_process = []  # list of PostJob objects created, not yet processed
+        jobs_to_process = []
 
         # Phase 1: pick news items for this batch and create their PostJob rows.
-        # Keep this part sequential (it's just fast DB writes).
         for news in base_qs.iterator():
             if processed_count >= batch_size:
                 break
@@ -581,29 +666,20 @@ class NewsViewSet(viewsets.ModelViewSet):
 
             processed_count += 1
 
-            for platform in platforms:
-                if platform.name == "telegram":
-                    for channel in telegram_channels:
-                        job = PostJob.objects.create(
-                            news=news,
-                            platform=platform,
-                            telegram_channel=channel,
-                            status="pending",
-                        )
-                        jobs_to_process.append(job)
-                elif platform.name == "buffer":
-                    for buffer_account in buffer_accounts:
-                        job = PostJob.objects.create(
-                            news=news,
-                            platform=platform,
-                            buffer_account=buffer_account,
-                            status="pending",
-                        )
-                        jobs_to_process.append(job)
+            # Use the news's associated buffer account
+            acct = news.buffer_account
+            if not acct or acct.connection_status != 'connected':
+                continue
 
-        # Phase 2: process all created jobs concurrently — this is the slow,
-        # network-bound part, so running several at once is where the real
-        # time savings come from.
+            job = PostJob.objects.create(
+                news=news,
+                platform=buffer_platform,
+                buffer_account=acct,
+                status="pending",
+            )
+            jobs_to_process.append(job)
+
+        # Phase 2: process all created jobs concurrently
         posted_count = 0
         failed_count = 0
 
