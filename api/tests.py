@@ -265,8 +265,8 @@ class PostAllEndpointTest(TestCase):
         data = response.json()
         self.assertEqual(data["total"], 0)
 
-    def test_skips_already_pending_news(self):
-        """News with a pending/processing PostJob should be excluded."""
+    def test_processes_pending_jobs(self):
+        """News with a pending PostJob should be reprocessed (no Celery worker)."""
         news = self._make_news(20)
         PostJob.objects.create(
             news=news,
@@ -279,7 +279,8 @@ class PostAllEndpointTest(TestCase):
 
         response = self.api_client.post("/api/news/post_all/", format="json")
         data = response.json()
-        self.assertEqual(data["total"], 0)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["posted"], 1)
 
     def test_posts_partially_failed_news(self):
         """News where all jobs are failed/permanent_fail/skipped should be posted again."""

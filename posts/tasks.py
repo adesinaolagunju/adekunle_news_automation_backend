@@ -4,7 +4,6 @@ import urllib.parse
 
 import time
 
-from celery import shared_task
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
@@ -13,12 +12,11 @@ from .models import PostJob, PostLog
 from social.buffer import BufferService, BufferRateLimitError
 from social.models import BufferAccount
 
-@shared_task
 def process_post_job(job_id):
     """Process a single post job"""
     
     try:
-        job = PostJob.objects.select_related('news', 'platform').get(id=job_id)
+        job = PostJob.objects.select_related('news', 'platform', 'buffer_account').get(id=job_id)
     except PostJob.DoesNotExist:
         return {"status": "job_not_found"}
     
@@ -299,36 +297,3 @@ def _extract_buffer_post_id(response):
     if isinstance(response, dict):
         return str(response.get('id')) if response.get('id') else None
     return None
-
-
-@shared_task
-def process_pending_jobs():
-    """Process all pending jobs"""
-    
-    pending_jobs = PostJob.objects.filter(
-        status__in=['pending', 'failed']
-    ).filter(
-        models.Q(next_retry_at__isnull=True) | models.Q(next_retry_at__lte=timezone.now())
-    ).exclude(
-        platform__enabled=False
-    )[:50]  # Process 50 at a time
-    
-    processed = 0
-    for job in pending_jobs:
-        process_post_job.delay(job.id)
-        processed += 1
-    
-    return {"processed": processed}
-
-
-@shared_task
-def cleanup_old_jobs(days=30):
-    """Clean up old successful jobs"""
-    cutoff = timezone.now() - timezone.timedelta(days=days)
-    
-    deleted = PostJob.objects.filter(
-        status='success',
-        created_at__lt=cutoff
-    ).delete()
-    
-    return {"deleted": deleted[0]}

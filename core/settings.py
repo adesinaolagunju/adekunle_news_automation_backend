@@ -27,7 +27,6 @@ INSTALLED_APPS = [
     # Third party
     'rest_framework',
     'corsheaders',
-    'django_celery_beat',
     'drf_spectacular',
     
     # Local
@@ -88,17 +87,6 @@ DATABASES = {
         ssl_require=True,
     )
 }
-
-# Redis & Celery
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-
-CELERY_BROKER_URL = REDIS_URL
-CELERY_RESULT_BACKEND = REDIS_URL
-CELERY_ACCEPT_CONTENT = ['application/json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'UTC'
-CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
 # CORS
 CORS_ALLOW_ALL_ORIGINS = True

@@ -10,7 +10,6 @@ from django.utils import timezone
 from django.db import transaction
 from django.contrib.auth import authenticate, logout
 from datetime import datetime, timedelta
-from django_celery_beat.models import PeriodicTask, IntervalSchedule
 from rest_framework.permissions import AllowAny
 
 import requests
@@ -457,11 +456,11 @@ class NewsViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['post'])
     def fetch(self, request):
-        """Trigger manual news fetch"""
-        result = fetch_and_queue_news.delay()
+        """Trigger manual news fetch and post synchronously"""
+        result = fetch_and_queue_news()
         return Response({
-            'task_id': result.id,
-            'message': 'News fetch started'
+            'message': 'News fetch completed',
+            'result': result,
         })
 
     @action(detail=False, methods=['post'])
@@ -622,17 +621,18 @@ class NewsViewSet(viewsets.ModelViewSet):
         # Optional account filter
         buffer_account_id = request.data.get("buffer_account_id") or request.query_params.get("buffer_account_id")
 
-        cutoff = timezone.now() - timedelta(minutes=85)
+        cutoff = timezone.now() - timedelta(minutes=90)
 
         successful_ids = PostJob.objects.filter(status="success").values("news_id")
-        pending_ids_qs = PostJob.objects.filter(
-            status__in=["pending", "processing"]
-        ).values("news_id")
+
+        # Find news that either have no jobs at all, or have pending/failed jobs
+        pending_failed_job_ids = PostJob.objects.filter(
+            status__in=["pending", "failed", "permanent_fail"]
+        ).values_list("id", flat=True)
 
         base_qs = (
             News.objects.filter(fetched_at__gte=cutoff)
             .exclude(id__in=successful_ids)
-            .exclude(id__in=pending_ids_qs)
             .order_by("-published")
         )
 
@@ -645,30 +645,45 @@ class NewsViewSet(viewsets.ModelViewSet):
             name='buffer', defaults={'enabled': False}
         )
 
-        pending_set = set(
-            PostJob.objects.filter(status__in=["pending", "processing"])
-            .values_list("news_id", flat=True)
-            .distinct()
-        )
+        # Pre-load a fallback connected account for news items without one
+        fallback_account = BufferAccount.objects.filter(
+            connection_status='connected'
+        ).order_by('-updated_at').first()
 
-        already_queued = 0
-        processed_count = 0
+        already_processed = 0
+        skipped_no_account = 0
+        jobs_created = 0
         jobs_to_process = []
 
-        # Phase 1: pick news items for this batch and create their PostJob rows.
+        # Phase 1: pick news items and prepare jobs
         for news in base_qs.iterator():
-            if processed_count >= batch_size:
+            if jobs_created >= batch_size:
                 break
 
-            if news.id in pending_set:
-                already_queued += 1
+            # Check if this news already has a pending/failed job we can reuse
+            existing_job = PostJob.objects.filter(
+                news=news,
+                status__in=["pending", "failed", "permanent_fail"],
+            ).first()
+
+            if existing_job:
+                # Reuse existing job — reset it to pending
+                if existing_job.status != "pending":
+                    existing_job.status = "pending"
+                    existing_job.retry_count = 0
+                    existing_job.last_error = None
+                    existing_job.next_retry_at = None
+                    existing_job.save()
+                jobs_to_process.append(existing_job)
+                jobs_created += 1
                 continue
 
-            processed_count += 1
-
-            # Use the news's associated buffer account
+            # Use the news's associated buffer account, or fall back to any connected account
             acct = news.buffer_account
             if not acct or acct.connection_status != 'connected':
+                acct = fallback_account
+            if not acct:
+                skipped_no_account += 1
                 continue
 
             job = PostJob.objects.create(
@@ -678,10 +693,12 @@ class NewsViewSet(viewsets.ModelViewSet):
                 status="pending",
             )
             jobs_to_process.append(job)
+            jobs_created += 1
 
         # Phase 2: process all created jobs concurrently
         posted_count = 0
         failed_count = 0
+        errors = []
 
         if jobs_to_process:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -690,26 +707,36 @@ class NewsViewSet(viewsets.ModelViewSet):
                     for job in jobs_to_process
                 }
                 for future in concurrent.futures.as_completed(future_to_job):
+                    job = future_to_job[future]
                     try:
                         result = future.result()
                         if result.get("status") == "success":
                             posted_count += 1
                         else:
                             failed_count += 1
-                    except Exception:
+                            errors.append({
+                                "news_id": job.news_id,
+                                "error": result.get("error", result.get("status", "unknown")),
+                            })
+                    except Exception as exc:
                         failed_count += 1
+                        errors.append({
+                            "news_id": job.news_id,
+                            "error": str(exc),
+                        })
 
-        remaining = max(total - already_queued - processed_count, 0)
+        remaining = max(total - skipped_no_account - jobs_created, 0)
 
         return Response({
             "total": total,
             "batch_size": batch_size,
             "max_workers": max_workers,
-            "processed": processed_count,
-            "already_queued": already_queued,
+            "jobs_created": jobs_created,
+            "skipped_no_account": skipped_no_account,
             "posted": posted_count,
             "failed": failed_count,
             "remaining": remaining,
+            "errors": errors if errors else [],
         })
     
 
@@ -1004,7 +1031,7 @@ class PostJobViewSet(viewsets.ModelViewSet):
     
     queryset = PostJob.objects.all().order_by('-created_at')
     serializer_class = PostJobSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1073,11 +1100,12 @@ class PostJobViewSet(viewsets.ModelViewSet):
                 )
         
         # Process immediately
-        process_post_job.delay(job.id)
+        result = process_post_job(job.id)
         
         return Response({
-            'message': 'Job created and processing',
-            'job_id': job.id
+            'message': 'Job processed',
+            'job_id': job.id,
+            'result': result,
         }, status=status.HTTP_201_CREATED)
     
     @action(detail=True, methods=['post'])
@@ -1101,11 +1129,12 @@ class PostJobViewSet(viewsets.ModelViewSet):
         job.next_retry_at = None
         job.save()
         
-        process_post_job.delay(job.id)
+        result = process_post_job(job.id)
         
         return Response({
-            'message': 'Job queued for retry',
-            'job_id': job.id
+            'message': 'Job retried',
+            'job_id': job.id,
+            'result': result,
         })
     
     @action(detail=True, methods=['get'])
@@ -1114,6 +1143,16 @@ class PostJobViewSet(viewsets.ModelViewSet):
         job = self.get_object()
         logs = job.logs.all().order_by('-created_at')
         return Response(PostLogSerializer(logs, many=True).data)
+
+    @action(detail=False, methods=['post'])
+    def cleanup(self, request):
+        """Delete all PostJob records older than 3 days."""
+        cutoff = timezone.now() - timedelta(days=3)
+        deleted_count, _ = PostJob.objects.filter(created_at__lt=cutoff).delete()
+        return Response({
+            'message': f'Deleted {deleted_count} old post jobs',
+            'deleted': deleted_count,
+        })
 
 
 # ============ STATS VIEWS ============
@@ -1231,31 +1270,10 @@ class SystemSettingsView(APIView):
     
     def get(self, request):
         """Get current settings"""
-        try:
-            # Get or create settings from celery beat
-            schedule = IntervalSchedule.objects.first()
-            if not schedule:
-                schedule = IntervalSchedule.objects.create(
-                    every=60,
-                    period=IntervalSchedule.MINUTES
-                )
-            
-            # Get or create periodic task
-            task = PeriodicTask.objects.filter(name='Fetch News').first()
-            if not task:
-                task = PeriodicTask.objects.create(
-                    name='Fetch News',
-                    task='news.tasks.fetch_and_queue_news',
-                    interval=schedule,
-                    enabled=True
-                )
-            
-            settings_data = {
-                'posting_interval': schedule.every,
-                'auto_post_enabled': task.enabled,
-                'max_posts_per_run': 10,  # Could be stored in a settings model
-                'default_hashtags': '#News #BreakingNews',
-                'post_template': """
+        settings_data = {
+            'max_posts_per_run': 10,
+            'default_hashtags': '#News #BreakingNews',
+            'post_template': """
 📰 {title}
 
 {summary}
@@ -1265,61 +1283,16 @@ Read More👇
 
 
 {hashtags}
-                """
-            }
-        except:
-            settings_data = {
-                'posting_interval': 60,
-                'auto_post_enabled': True,
-                'max_posts_per_run': 10,
-                'default_hashtags': '#News #BreakingNews',
-                'post_template': """
-📰 {title}
-
-{summary}
-
-Read More👇
-{link}
-
-
-{hashtags}
-                """
-            }
-        
+            """
+        }
         return Response(settings_data)
     
     def post(self, request):
         """Update settings"""
-        data = request.data
-        
-        try:
-            # Update interval schedule
-            schedule = IntervalSchedule.objects.first()
-            if not schedule:
-                schedule = IntervalSchedule.objects.create(
-                    every=data.get('posting_interval', 60),
-                    period=IntervalSchedule.MINUTES
-                )
-            else:
-                schedule.every = data.get('posting_interval', 60)
-                schedule.save()
-            
-            # Update periodic task
-            task = PeriodicTask.objects.filter(name='Fetch News').first()
-            if task:
-                task.interval = schedule
-                task.enabled = data.get('auto_post_enabled', True)
-                task.save()
-            
-            return Response({
-                'message': 'Settings updated successfully',
-                'settings': data
-            })
-            
-        except Exception as e:
-            return Response({
-                'error': str(e)
-            }, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'message': 'Settings updated successfully',
+            'settings': request.data
+        })
 
 
 

@@ -1,8 +1,5 @@
-amqp==5.3.1
 asgiref==3.11.1
 attrs==26.1.0
-billiard==4.2.4
-celery==5.6.3
 certifi==2026.6.17
 cffi==2.0.0
 charset-normalizer==3.4.7
@@ -14,7 +11,6 @@ cron-descriptor==1.4.5
 cryptography==49.0.0
 dj-database-url==3.1.2
 Django==6.0.6
-django-celery-beat==2.9.0
 django-cors-headers==4.9.0
 django-timezone-field==7.2.2
 djangorestframework==3.17.1
@@ -25,7 +21,6 @@ idna==3.18
 inflection==0.5.1
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-kombu==5.6.2
 packaging==26.2
 prompt_toolkit==3.0.52
 psycopg2-binary==2.9.12
@@ -46,6 +41,5 @@ tzdata==2026.2
 tzlocal==5.4.4
 uritemplate==4.2.0
 urllib3==2.7.0
-vine==5.1.0
 wcwidth==0.8.2
 whitenoise==6.12.0

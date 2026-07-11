@@ -1,3 +1,7 @@
-celery -A core worker -l info
+# Adekunle News Automation Backend
 
-celery -A core beat -l info
+## Running
+
+```bash
+python manage.py runserver
+```
