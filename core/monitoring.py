@@ -23,7 +23,9 @@ from django.db.backends.base import base as base_backend
 logger = logging.getLogger("db.monitoring")
 
 # ---------------------------------------------------------------------------
-# Connection tracker — counts open / close events per thread.
+# Connection tracker — counts actual open / close events per thread.
+# Only increments when a connection is actually created or destroyed,
+# not on every ensure_connection() or close() call.
 # ---------------------------------------------------------------------------
 
 _lock = threading.Lock()
@@ -62,6 +64,10 @@ def _on_close(alias):
 
 # ---------------------------------------------------------------------------
 # Monkey-patch Django's DatabaseWrapper
+#
+# Only count when a connection is *actually* created or destroyed:
+#   ensure_connection: only count when self.connection is None (new connect)
+#   close: only count when self.connection is not None (actual close)
 # ---------------------------------------------------------------------------
 
 _original_ensure = base_backend.BaseDatabaseWrapper.ensure_connection
@@ -69,12 +75,14 @@ _original_close = base_backend.BaseDatabaseWrapper.close
 
 
 def _patched_ensure_connection(self):
-    _on_open(self.alias)
+    if self.connection is None:
+        _on_open(self.alias)
     return _original_ensure(self)
 
 
 def _patched_close(self):
-    _on_close(self.alias)
+    if self.connection is not None:
+        _on_close(self.alias)
     return _original_close(self)
 
 

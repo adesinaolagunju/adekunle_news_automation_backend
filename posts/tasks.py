@@ -2,6 +2,7 @@
 import re
 import urllib.parse
 import contextlib
+import logging
 
 import time
 
@@ -12,6 +13,8 @@ from django.db import transaction
 from .models import PostJob, PostLog, ConcurrentTaskLock
 from social.buffer import BufferService, BufferRateLimitError
 from social.models import BufferAccount
+
+logger = logging.getLogger("db.monitoring")
 
 
 class AlreadyRunning(Exception):
@@ -259,6 +262,11 @@ def process_buffer_job(job):
     succeeded = []
     failures = []
 
+    logger.info(
+        "BUFFER JOB START job_id=%s  channels=%d  account=%s",
+        job.id, len(channels), buffer_account.id,
+    )
+
     for channel in channels:
         channel_id = channel['id']
         service_name = channel.get('service', 'unknown')
@@ -277,6 +285,10 @@ def process_buffer_job(job):
 
         try:
             post_result = _try_post(image_url)
+            logger.info(
+                "BUFFER POST OK  job_id=%s  channel=%s (%s)  result=%s",
+                job.id, channel_id, service_name, post_result,
+            )
             succeeded.append({
                 'channel_id': channel_id,
                 'service': service_name,
@@ -334,6 +346,10 @@ def process_buffer_job(job):
                 'display_name': display_name,
                 'error': str(exc),
             })
+            logger.warning(
+                "BUFFER POST FAIL job_id=%s  channel=%s (%s)  error=%s",
+                job.id, channel_id, service_name, exc,
+            )
 
     if failures and not succeeded:
         all_errors = "; ".join(
@@ -344,7 +360,7 @@ def process_buffer_job(job):
             f"All {len(failures)} channel(s) failed: {all_errors}"
         )
 
-    return {
+    result = {
         'response': {
             'channels_posted': len(succeeded),
             'channels_attempted': len(channels),
@@ -356,6 +372,13 @@ def process_buffer_job(job):
             if succeeded else None
         ),
     }
+
+    logger.info(
+        "BUFFER JOB END   job_id=%s  posted=%d/%d  message_id=%s",
+        job.id, len(succeeded), len(channels), result['message_id'],
+    )
+
+    return result
 
 
 def _resolve_news_image(news):
