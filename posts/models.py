@@ -80,7 +80,9 @@ class PostJob(models.Model):
         self.posted_at = timezone.now()
         self.response = response_data
         self.message_id = message_id
-        self.save()
+        self.save(update_fields=[
+            'status', 'posted_at', 'response', 'message_id',
+        ])
         
         # Mark news as processed if all jobs for this news are done
         self._update_news_processed()
@@ -98,7 +100,9 @@ class PostJob(models.Model):
             delay_minutes = [5, 30, 120][self.retry_count - 1] if self.retry_count <= 3 else 120
             self.next_retry_at = timezone.now() + timezone.timedelta(minutes=delay_minutes)
         
-        self.save()
+        self.save(update_fields=[
+            'last_error', 'retry_count', 'status', 'next_retry_at',
+        ])
     
     def _update_news_processed(self):
         """Update news.is_processed if all jobs are complete"""
@@ -106,7 +110,7 @@ class PostJob(models.Model):
             return
         
         self.news.is_processed = True
-        self.news.save()
+        self.news.save(update_fields=['is_processed'])
 
 class PostLog(models.Model):
     """Audit log for all posts"""
@@ -119,3 +123,32 @@ class PostLog(models.Model):
     
     class Meta:
         ordering = ['-created_at']
+
+
+class ConcurrentTaskLock(models.Model):
+    """Distributed lock for preventing overlapping task executions.
+
+    Each row represents one named operation (e.g. ``fetch_recent``,
+    ``post_all``).  The ``locked_at`` timestamp indicates whether the
+    operation is currently running on *some* instance.
+
+    The row-level lock (``SELECT … FOR UPDATE``) is only held for the
+    brief transaction that checks/sets ``locked_at``.  The actual work
+    runs outside any transaction, so long-running HTTP calls do not
+    hold database locks or connections open.
+
+    If an instance crashes without clearing its timestamp, the
+    ``stale_after`` class attribute (seconds) allows another instance
+    to take over once the timestamp is old enough.
+    """
+
+    stale_after = 1200  # 20 minutes — generous ceiling for longest operation
+
+    task_name = models.CharField(max_length=100, unique=True)
+    locked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "concurrent_task_locks"
+
+    def __str__(self):
+        return f"{self.task_name} (locked={self.locked_at})"

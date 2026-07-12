@@ -21,6 +21,12 @@ def fetch_and_queue_news():
         print("No connected Buffer accounts found")
         return {"status": "no_accounts", "count": 0}
 
+    # Pre-fetch Buffer platform once — avoids get_or_create per news item.
+    platform, _ = SocialPlatform.objects.get_or_create(
+        name='buffer',
+        defaults={'enabled': False}
+    )
+
     total_saved = 0
     total_posted = 0
 
@@ -45,11 +51,6 @@ def fetch_and_queue_news():
         for news in new_news:
             if not fetcher.should_post_news(news):
                 continue
-
-            platform, _ = SocialPlatform.objects.get_or_create(
-                name='buffer',
-                defaults={'enabled': False}
-            )
 
             job = PostJob.objects.create(
                 news=news,

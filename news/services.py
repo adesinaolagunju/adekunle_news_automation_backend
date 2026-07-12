@@ -2,7 +2,6 @@
 import requests
 from datetime import datetime, timedelta
 from django.utils import timezone
-from django.db import transaction
 from .models import News, NewsFilterRule
 
 DEFAULT_API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
@@ -59,21 +58,20 @@ class NewsFetcher:
         saved_count = 0
         new_news = []
         
-        with transaction.atomic():
-            for item in news_list:
-                api_id = item.get('id')
-                
-                # Check if news already exists for this account
-                if News.objects.filter(
-                    api_news_id=api_id,
-                    buffer_account=buffer_account
-                ).exists():
-                    continue
-                
-                # Create new news
-                news = News.create_from_api(item, buffer_account=buffer_account)
-                new_news.append(news)
-                saved_count += 1
+        for item in news_list:
+            api_id = item.get('id')
+            
+            # Check if news already exists for this account
+            if News.objects.filter(
+                api_news_id=api_id,
+                buffer_account=buffer_account
+            ).exists():
+                continue
+            
+            # Create new news
+            news = News.create_from_api(item, buffer_account=buffer_account)
+            new_news.append(news)
+            saved_count += 1
         
         return saved_count, new_news
     

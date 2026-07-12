@@ -83,7 +83,7 @@ DATABASES = {
         env="DATABASE_URL",
         # default="postgresql://adekunle:gOEgNARWMelB51tgX6D3t71TJUhmVkq0@dpg-d9304l6rnols7381mh00-a.oregon-postgres.render.com/adekunle",
         default="postgresql://postgres.fvofpqzlpllsoshdjpkw:sulaimanadekunle@aws-0-eu-west-3.pooler.supabase.com:5432/postgres",
-        conn_max_age=600,
+        conn_max_age=0,
         ssl_require=True,
     )
 }
@@ -121,6 +121,39 @@ DEFAULT_NEWS_IMAGE_URL = os.getenv(
 )
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "monitor": {
+            "format": (
+                "[%(asctime)s] %(levelname)s %(name)s "
+                "%(message)s"
+            ),
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "monitor",
+        },
+    },
+    "loggers": {
+        "db.monitoring": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
+
+# Activate DB connection / job monitoring (patches DB backend at import).
+import core.monitoring  # noqa: E402, F401
 
 
 

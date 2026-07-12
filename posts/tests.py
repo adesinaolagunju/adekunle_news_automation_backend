@@ -1,8 +1,10 @@
 from unittest.mock import patch, MagicMock
 
 from django.test import TestCase
+from django.utils import timezone
 
-from posts.tasks import _build_hashtags, _build_buffer_message
+from posts.tasks import _build_hashtags, _build_buffer_message, task_lock, AlreadyRunning
+from posts.models import ConcurrentTaskLock
 
 
 def _mock_news(**kwargs):
@@ -126,3 +128,64 @@ class BuildBufferMessageTest(TestCase):
         self.assertIn("#BreakingNews #Latest", result)
         self.assertNotIn("#None", result)
         self.assertNotIn("# ", result)
+
+
+class TaskLockTest(TestCase):
+    """Tests for the ``task_lock`` distributed lock context manager."""
+
+    def test_lock_acquired_and_released(self):
+        """Lock row should have locked_at set inside the context and cleared after."""
+        with task_lock("test_op"):
+            lock = ConcurrentTaskLock.objects.get(task_name="test_op")
+            self.assertIsNotNone(lock.locked_at)
+        lock.refresh_from_db()
+        self.assertIsNone(lock.locked_at)
+
+    def test_already_running_raises(self):
+        """A second caller should get AlreadyRunning when the lock is held."""
+        lock = ConcurrentTaskLock.objects.create(
+            task_name="test_busy",
+            locked_at=timezone.now(),
+        )
+        with self.assertRaises(AlreadyRunning):
+            with task_lock("test_busy"):
+                pass
+
+    def test_stale_lock_allows_reacquire(self):
+        """A lock older than stale_after should be treated as stale."""
+        ConcurrentTaskLock.objects.create(
+            task_name="test_stale",
+            locked_at=timezone.now() - timezone.timedelta(seconds=600),
+        )
+        with task_lock("test_stale", stale_after=120):
+            lock = ConcurrentTaskLock.objects.get(task_name="test_stale")
+            self.assertIsNotNone(lock.locked_at)
+        lock.refresh_from_db()
+        self.assertIsNone(lock.locked_at)
+
+    def test_lock_cleared_on_exception(self):
+        """Lock should be cleared even if the context body raises."""
+        try:
+            with task_lock("test_exc"):
+                raise ValueError("boom")
+        except ValueError:
+            pass
+        lock = ConcurrentTaskLock.objects.get(task_name="test_exc")
+        self.assertIsNone(lock.locked_at)
+
+    def test_different_task_names_are_independent(self):
+        """Locking task A should not block locking task B."""
+        with task_lock("task_a"):
+            with task_lock("task_b"):
+                self.assertTrue(
+                    ConcurrentTaskLock.objects.filter(task_name="task_a").exists()
+                )
+                self.assertTrue(
+                    ConcurrentTaskLock.objects.filter(task_name="task_b").exists()
+                )
+
+    def test_creates_row_if_not_exists(self):
+        """task_lock should auto-create the ConcurrentTaskLock row."""
+        self.assertFalse(ConcurrentTaskLock.objects.filter(task_name="auto_create").exists())
+        with task_lock("auto_create"):
+            self.assertTrue(ConcurrentTaskLock.objects.filter(task_name="auto_create").exists())

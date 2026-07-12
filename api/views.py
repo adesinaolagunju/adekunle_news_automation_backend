@@ -7,7 +7,7 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import AuthenticationFailed, PermissionDenied, ValidationError
 from django.db.models import Count, Q
 from django.utils import timezone
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.contrib.auth import authenticate, logout
 from datetime import datetime, timedelta
 from rest_framework.permissions import AllowAny
@@ -18,7 +18,8 @@ from news.models import News, Category, Country, NewsFilterRule
 from news.services import NewsFetcher
 from social.models import BufferAccount, TelegramChannel, SocialPlatform
 from posts.models import PostJob, PostLog
-from posts.tasks import process_post_job
+from posts.tasks import process_post_job, task_lock, AlreadyRunning
+from core.monitoring import monitor_post_job, connection_snapshot
 from news.tasks import fetch_and_queue_news
 from social.buffer import BufferAuthenticationError, BufferService, BufferServiceError
 from social.telegram import TelegramService
@@ -28,6 +29,54 @@ from .serializers import *
 
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiExample
 from rest_framework_simplejwt.tokens import RefreshToken
+
+
+def _should_post_news(news, rules):
+    """Check if news should be posted based on pre-fetched filter rules.
+
+    Identical logic to ``NewsFetcher.should_post_news`` but accepts a
+    pre-fetched list of ``NewsFilterRule`` objects so it can be called
+    inside loops without re-querying the database each time.
+    """
+    for rule in rules:
+        value_lower = rule.value.lower()
+
+        if rule.rule_type == 'category':
+            match = news.category.lower() == value_lower
+        elif rule.rule_type == 'country':
+            match = (news.country or '').lower() == value_lower
+        elif rule.rule_type == 'source':
+            match = news.source.lower() == value_lower
+        elif rule.rule_type == 'keyword':
+            match = (
+                value_lower in news.title.lower()
+                or value_lower in (news.summary or '').lower()
+            )
+        else:
+            continue
+
+        if rule.rule_action == 'exclude' and match:
+            return False
+
+        if rule.rule_action == 'include' and not match:
+            return False
+
+    include_rules = [r for r in rules if r.rule_action == 'include']
+    if include_rules:
+        for rule in include_rules:
+            if rule.rule_type == 'category' and news.category.lower() == rule.value.lower():
+                return True
+            if rule.rule_type == 'country' and (news.country or '').lower() == rule.value.lower():
+                return True
+            if rule.rule_type == 'source' and news.source.lower() == rule.value.lower():
+                return True
+            if rule.rule_type == 'keyword':
+                if (rule.value.lower() in news.title.lower()
+                        or rule.value.lower() in (news.summary or '').lower()):
+                    return True
+        return False
+
+    return True
 
 
 
@@ -472,15 +521,35 @@ class NewsViewSet(viewsets.ModelViewSet):
 
         Returns a summary of what was fetched, saved, and queued per account.
         """
-        accounts = BufferAccount.objects.filter(
-            connection_status='connected'
-        ).order_by('-updated_at')
+        try:
+            with task_lock('fetch_recent'):
+                return self._fetch_recent_inner(request)
+        except AlreadyRunning as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-        if not accounts.exists():
+    def _fetch_recent_inner(self, request):
+        accounts = list(BufferAccount.objects.filter(
+            connection_status='connected'
+        ).order_by('-updated_at'))
+
+        if not accounts:
             return Response(
                 {"error": "No connected Buffer accounts found"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # Pre-fetch Buffer platform once — avoids get_or_create per item.
+        buffer_platform, _ = SocialPlatform.objects.get_or_create(
+            name='buffer',
+            defaults={'enabled': False},
+        )
+
+        # Pre-fetch enabled filter rules once — avoids re-querying per news item.
+        from news.models import NewsFilterRule
+        filter_rules = list(NewsFilterRule.objects.filter(enabled=True))
 
         accounts_processed = 0
         total_fetched = 0
@@ -494,6 +563,14 @@ class NewsViewSet(viewsets.ModelViewSet):
             fetcher = NewsFetcher(api_url=account.api_url)
             url = fetcher.api_url
 
+            # Bulk-load existing api_news_ids for this account to avoid
+            # per-item EXISTS queries (N+1 elimination).
+            existing_ids = set(
+                News.objects.filter(
+                    buffer_account=account
+                ).values_list('api_news_id', flat=True)
+            )
+
             acct_fetched = 0
             acct_new = 0
             acct_duplicates = 0
@@ -502,6 +579,9 @@ class NewsViewSet(viewsets.ModelViewSet):
             max_pages = 10
 
             while url and acct_pages < max_pages:
+                # Release DB connection before upstream HTTP call.
+                close_old_connections()
+
                 try:
                     response = fetcher.session.get(url, timeout=30)
                     response.raise_for_status()
@@ -540,24 +620,18 @@ class NewsViewSet(viewsets.ModelViewSet):
                     if not api_id:
                         continue
 
-                    if News.objects.filter(
-                        api_news_id=api_id,
-                        buffer_account=account
-                    ).exists():
+                    if api_id in existing_ids:
                         acct_duplicates += 1
                         continue
 
                     news = News.create_from_api(item, buffer_account=account)
+                    existing_ids.add(api_id)
                     acct_new += 1
 
-                    if fetcher.should_post_news(news):
-                        platform, _ = SocialPlatform.objects.get_or_create(
-                            name='buffer',
-                            defaults={'enabled': False},
-                        )
+                    if _should_post_news(news, filter_rules):
                         PostJob.objects.create(
                             news=news,
-                            platform=platform,
+                            platform=buffer_platform,
                             buffer_account=account,
                             status="pending",
                         )
@@ -607,6 +681,16 @@ class NewsViewSet(viewsets.ModelViewSet):
         Optionally filter by buffer_account_id.
         """
         try:
+            with task_lock('post_all'):
+                return self._post_all_inner(request)
+        except AlreadyRunning as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+    def _post_all_inner(self, request):
+        try:
             batch_size = int(request.data.get("batch_size") or request.query_params.get("batch_size") or 5)
         except (TypeError, ValueError):
             batch_size = 5
@@ -625,11 +709,6 @@ class NewsViewSet(viewsets.ModelViewSet):
 
         successful_ids = PostJob.objects.filter(status="success").values("news_id")
 
-        # Find news that either have no jobs at all, or have pending/failed jobs
-        pending_failed_job_ids = PostJob.objects.filter(
-            status__in=["pending", "failed", "permanent_fail"]
-        ).values_list("id", flat=True)
-
         base_qs = (
             News.objects.filter(fetched_at__gte=cutoff)
             .exclude(id__in=successful_ids)
@@ -639,7 +718,23 @@ class NewsViewSet(viewsets.ModelViewSet):
         if buffer_account_id:
             base_qs = base_qs.filter(buffer_account_id=buffer_account_id)
 
-        total = base_qs.count()
+        # Collect candidate news IDs first (bounded by batch_size).
+        candidate_ids = list(base_qs.values_list('id', flat=True)[:batch_size])
+        total = len(candidate_ids)
+
+        if not candidate_ids:
+            return Response({
+                "total": 0,
+                "batch_size": batch_size,
+                "max_workers": max_workers,
+                "jobs_created": 0,
+                "skipped_no_account": 0,
+                "posted": 0,
+                "failed": 0,
+                "remaining": 0,
+                "errors": [],
+                "db_pool": connection_snapshot(),
+            })
 
         buffer_platform, _ = SocialPlatform.objects.get_or_create(
             name='buffer', defaults={'enabled': False}
@@ -650,35 +745,47 @@ class NewsViewSet(viewsets.ModelViewSet):
             connection_status='connected'
         ).order_by('-updated_at').first()
 
-        already_processed = 0
+        # Batch-load existing jobs for all candidate news — eliminates
+        # per-item PostJob.objects.filter().first() (N+1 elimination).
+        existing_jobs_map = {}
+        for job in PostJob.objects.filter(
+            news_id__in=candidate_ids,
+            status__in=["pending", "failed", "permanent_fail"],
+        ).select_related('news'):
+            # Keep only the most recent job per news item.
+            if job.news_id not in existing_jobs_map:
+                existing_jobs_map[job.news_id] = job
+
         skipped_no_account = 0
         jobs_created = 0
         jobs_to_process = []
 
         # Phase 1: pick news items and prepare jobs
-        for news in base_qs.iterator():
+        # Re-fetch full News objects only for the candidates.
+        news_by_id = {
+            n.id: n for n in News.objects.filter(id__in=candidate_ids)
+        }
+
+        for news_id in candidate_ids:
             if jobs_created >= batch_size:
                 break
 
-            # Check if this news already has a pending/failed job we can reuse
-            existing_job = PostJob.objects.filter(
-                news=news,
-                status__in=["pending", "failed", "permanent_fail"],
-            ).first()
+            news = news_by_id[news_id]
 
+            existing_job = existing_jobs_map.get(news_id)
             if existing_job:
-                # Reuse existing job — reset it to pending
                 if existing_job.status != "pending":
                     existing_job.status = "pending"
                     existing_job.retry_count = 0
                     existing_job.last_error = None
                     existing_job.next_retry_at = None
-                    existing_job.save()
-                jobs_to_process.append(existing_job)
+                    existing_job.save(update_fields=[
+                        "status", "retry_count", "last_error", "next_retry_at",
+                    ])
+                jobs_to_process.append((existing_job.id, news_id))
                 jobs_created += 1
                 continue
 
-            # Use the news's associated buffer account, or fall back to any connected account
             acct = news.buffer_account
             if not acct or acct.connection_status != 'connected':
                 acct = fallback_account
@@ -692,8 +799,12 @@ class NewsViewSet(viewsets.ModelViewSet):
                 buffer_account=acct,
                 status="pending",
             )
-            jobs_to_process.append(job)
+            jobs_to_process.append((job.id, news_id))
             jobs_created += 1
+
+        # Release main thread DB connection before concurrent processing.
+        # Each worker thread manages its own connection via process_post_job().
+        close_old_connections()
 
         # Phase 2: process all created jobs concurrently
         posted_count = 0
@@ -702,12 +813,12 @@ class NewsViewSet(viewsets.ModelViewSet):
 
         if jobs_to_process:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_job = {
-                    executor.submit(process_post_job, job.id): job
-                    for job in jobs_to_process
+                future_to_ids = {
+                    executor.submit(monitor_post_job, job_id): (job_id, news_id)
+                    for job_id, news_id in jobs_to_process
                 }
-                for future in concurrent.futures.as_completed(future_to_job):
-                    job = future_to_job[future]
+                for future in concurrent.futures.as_completed(future_to_ids):
+                    job_id, news_id = future_to_ids[future]
                     try:
                         result = future.result()
                         if result.get("status") == "success":
@@ -715,15 +826,16 @@ class NewsViewSet(viewsets.ModelViewSet):
                         else:
                             failed_count += 1
                             errors.append({
-                                "news_id": job.news_id,
+                                "news_id": news_id,
                                 "error": result.get("error", result.get("status", "unknown")),
                             })
                     except Exception as exc:
                         failed_count += 1
                         errors.append({
-                            "news_id": job.news_id,
+                            "news_id": news_id,
                             "error": str(exc),
                         })
+            close_old_connections()
 
         remaining = max(total - skipped_no_account - jobs_created, 0)
 
@@ -737,6 +849,7 @@ class NewsViewSet(viewsets.ModelViewSet):
             "failed": failed_count,
             "remaining": remaining,
             "errors": errors if errors else [],
+            "db_pool": connection_snapshot(),
         })
     
 
@@ -761,13 +874,12 @@ class NewsViewSet(viewsets.ModelViewSet):
             defaults={'enabled': False},
         )
 
-        with transaction.atomic():
-            job = PostJob.objects.create(
-                news=news,
-                platform=platform,
-                buffer_account=buffer_account,
-                status='pending'
-            )
+        job = PostJob.objects.create(
+            news=news,
+            platform=platform,
+            buffer_account=buffer_account,
+            status='pending'
+        )
 
         result = process_post_job(job.id)
 
@@ -1083,21 +1195,20 @@ class PostJobViewSet(viewsets.ModelViewSet):
         news = data['news']
         platform = data['platform']
         
-        with transaction.atomic():
-            if platform.name == 'telegram':
-                job = PostJob.objects.create(
-                    news=news,
-                    platform=platform,
-                    telegram_channel=data['telegram_channel'],
-                    status='pending'
-                )
-            elif platform.name == 'buffer':
-                job = PostJob.objects.create(
-                    news=news,
-                    platform=platform,
-                    buffer_account=data['buffer_account'],
-                    status='pending'
-                )
+        if platform.name == 'telegram':
+            job = PostJob.objects.create(
+                news=news,
+                platform=platform,
+                telegram_channel=data['telegram_channel'],
+                status='pending'
+            )
+        elif platform.name == 'buffer':
+            job = PostJob.objects.create(
+                news=news,
+                platform=platform,
+                buffer_account=data['buffer_account'],
+                status='pending'
+            )
         
         # Process immediately
         result = process_post_job(job.id)
@@ -1166,42 +1277,60 @@ class DashboardStatsView(APIView):
         today_start = timezone.make_aware(
             datetime.combine(today, datetime.min.time())
         )
-        tomorrow_start = today_start + timedelta(days=1)
         
-        # News stats
+        # News stats — single query each.
         total_news = News.objects.count()
         news_today = News.objects.filter(fetched_at__gte=today_start).count()
         
-        # Post stats
-        total_posts = PostJob.objects.count()
-        posts_today = PostJob.objects.filter(created_at__gte=today_start).count()
-        pending_posts = PostJob.objects.filter(status='pending').count()
-        failed_posts = PostJob.objects.filter(status__in=['failed', 'permanent_fail']).count()
-        success_posts = PostJob.objects.filter(status='success').count()
+        # Post stats — single query with aggregation instead of 5 separate counts.
+        from django.db.models import Count, Q as QFilter
+        post_stats = PostJob.objects.aggregate(
+            total=Count('id'),
+            today_count=Count('id', filter=QFilter(created_at__gte=today_start)),
+            pending=Count('id', filter=QFilter(status='pending')),
+            failed=Count('id', filter=QFilter(status__in=['failed', 'permanent_fail'])),
+            success=Count('id', filter=QFilter(status='success')),
+        )
         
-        success_rate = (success_posts / total_posts * 100) if total_posts > 0 else 0
+        total_posts = post_stats['total']
+        success_rate = (post_stats['success'] / total_posts * 100) if total_posts > 0 else 0
         
-        # Platform stats
+        # Platform stats — single aggregated query instead of N+1.
+        platform_rows = (
+            PostJob.objects
+            .values('platform__name')
+            .annotate(
+                total=Count('id'),
+                success=Count('id', filter=QFilter(status='success')),
+                failed=Count('id', filter=QFilter(status__in=['failed', 'permanent_fail'])),
+                pending=Count('id', filter=QFilter(status='pending')),
+            )
+            .order_by('platform__name')
+        )
+        
         platforms = {}
-        for platform in SocialPlatform.objects.all():
-            platform_jobs = PostJob.objects.filter(platform=platform)
-            platform_success = platform_jobs.filter(status='success').count()
-            platform_total = platform_jobs.count()
-            
-            platforms[platform.name] = {
-                'total': platform_total,
-                'success': platform_success,
-                'failed': platform_jobs.filter(status__in=['failed', 'permanent_fail']).count(),
-                'pending': platform_jobs.filter(status='pending').count(),
-                'success_rate': (platform_success / platform_total * 100) if platform_total > 0 else 0
+        for row in platform_rows:
+            name = row['platform__name']
+            t = row['total']
+            platforms[name] = {
+                'total': t,
+                'success': row['success'],
+                'failed': row['failed'],
+                'pending': row['pending'],
+                'success_rate': round((row['success'] / t * 100) if t > 0 else 0, 2),
             }
         
-        # Category stats
-        categories = {}
-        for category in Category.objects.filter(enabled=True):
-            count = News.objects.filter(category=category.name).count()
-            if count > 0:
-                categories[category.name] = count
+        # Category stats — single annotated query instead of N+1.
+        category_rows = (
+            News.objects
+            .filter(category__isnull=False)
+            .exclude(category='')
+            .values('category')
+            .annotate(count=Count('id'))
+            .order_by('-count')
+        )
+        
+        categories = {row['category']: row['count'] for row in category_rows}
         
         # Last run info
         last_job = PostJob.objects.order_by('-created_at').first()
@@ -1221,9 +1350,9 @@ class DashboardStatsView(APIView):
             'total_news': total_news,
             'news_today': news_today,
             'total_posts': total_posts,
-            'posts_today': posts_today,
-            'pending_posts': pending_posts,
-            'failed_posts': failed_posts,
+            'posts_today': post_stats['today_count'],
+            'pending_posts': post_stats['pending'],
+            'failed_posts': post_stats['failed'],
             'success_rate': round(success_rate, 2),
             'last_run': last_job.created_at if last_job else None,
             'next_run': next_run,
@@ -1239,24 +1368,32 @@ class PlatformStatsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     
     def get(self, request):
-        stats = []
+        from django.db.models import Count, Q as QFilter, Max
         
-        for platform in SocialPlatform.objects.all():
-            platform_jobs = PostJob.objects.filter(platform=platform)
-            total = platform_jobs.count()
-            success = platform_jobs.filter(status='success').count()
-            failed = platform_jobs.filter(status__in=['failed', 'permanent_fail']).count()
-            pending = platform_jobs.filter(status='pending').count()
-            last_post = platform_jobs.filter(status='success').order_by('-posted_at').first()
-            
+        rows = (
+            PostJob.objects
+            .values('platform__name')
+            .annotate(
+                total=Count('id'),
+                success=Count('id', filter=QFilter(status='success')),
+                failed=Count('id', filter=QFilter(status__in=['failed', 'permanent_fail'])),
+                pending=Count('id', filter=QFilter(status='pending')),
+                last_posted_at=Max('posted_at', filter=QFilter(status='success')),
+            )
+            .order_by('platform__name')
+        )
+        
+        stats = []
+        for row in rows:
+            t = row['total']
             stats.append({
-                'platform': platform.name,
-                'total_posts': total,
-                'success_posts': success,
-                'failed_posts': failed,
-                'pending': pending,
-                'success_rate': round((success / total * 100) if total > 0 else 0, 2),
-                'last_post': last_post.posted_at if last_post else None
+                'platform': row['platform__name'],
+                'total_posts': t,
+                'success_posts': row['success'],
+                'failed_posts': row['failed'],
+                'pending': row['pending'],
+                'success_rate': round((row['success'] / t * 100) if t > 0 else 0, 2),
+                'last_post': row['last_posted_at'],
             })
         
         return Response(stats)

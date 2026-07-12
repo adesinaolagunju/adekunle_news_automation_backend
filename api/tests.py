@@ -8,7 +8,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from news.models import News, NewsFilterRule
-from posts.models import PostJob
+from posts.models import PostJob, ConcurrentTaskLock
 from social.models import SocialPlatform, BufferAccount
 
 User = get_user_model()
@@ -227,8 +227,8 @@ class PostAllEndpointTest(TestCase):
         return News.objects.create(api_news_id=api_news_id, **defaults)
 
     def _patch_process_post_job(self, status="success"):
-        """Patch process_post_job to return immediately instead of calling real services."""
-        patcher = patch("api.views.process_post_job")
+        """Patch monitor_post_job to return immediately instead of calling real services."""
+        patcher = patch("api.views.monitor_post_job")
         mock_fn = patcher.start()
         self.addCleanup(patcher.stop)
         mock_fn.return_value = {"status": status, "job_id": 1}
@@ -351,3 +351,100 @@ class PostAllEndpointTest(TestCase):
         data = response.json()
         self.assertEqual(data["total"], 1)
         self.assertEqual(data["posted"], 1)
+
+
+class FetchRecentLockTest(TestCase):
+    """Tests that fetch_recent returns 409 when already running."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            username="lockuser", password="testpass"
+        )
+        cls.platform_buffer, _ = SocialPlatform.objects.get_or_create(
+            name="buffer", defaults={"enabled": True}
+        )
+        cls.platform_buffer.enabled = True
+        cls.platform_buffer.save(update_fields=["enabled"])
+        cls.buffer_account = BufferAccount.objects.create(
+            user=cls.user,
+            name="Test Account",
+            api_key="test-key",
+            api_url="https://example.com/api/news/",
+            connection_status="connected",
+        )
+
+    def setUp(self):
+        self.api_client = APIClient()
+        self.api_client.force_authenticate(user=self.user)
+
+    def test_returns_409_when_already_running(self):
+        """A second fetch_recent call while one is running should return 409."""
+        ConcurrentTaskLock.objects.create(
+            task_name="fetch_recent",
+            locked_at=timezone.now(),
+        )
+        response = self.api_client.post("/api/news/fetch_recent/", format="json")
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("error", response.json())
+
+    def test_proceeds_when_lock_is_stale(self):
+        """A stale lock (older than 20 min) should be overridden."""
+        ConcurrentTaskLock.objects.create(
+            task_name="fetch_recent",
+            locked_at=timezone.now() - timezone.timedelta(seconds=1200),
+        )
+        mock_fetcher = MagicMock()
+        mock_fetcher.api_url = self.buffer_account.api_url
+        mock_fetcher.session.get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"results": [], "next": None},
+        )
+        with patch("api.views.NewsFetcher", return_value=mock_fetcher):
+            response = self.api_client.post("/api/news/fetch_recent/", format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class PostAllLockTest(TestCase):
+    """Tests that post_all returns 409 when already running."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            username="lockuser2", password="testpass"
+        )
+        cls.platform_buffer, _ = SocialPlatform.objects.get_or_create(
+            name="buffer", defaults={"enabled": True}
+        )
+        cls.platform_buffer.enabled = True
+        cls.platform_buffer.save(update_fields=["enabled"])
+        cls.buffer_account = BufferAccount.objects.create(
+            user=cls.user,
+            name="Test Account",
+            api_key="test-key",
+            api_url="https://example.com/api/news/",
+            connection_status="connected",
+        )
+
+    def setUp(self):
+        self.api_client = APIClient()
+        self.api_client.force_authenticate(user=self.user)
+
+    def test_returns_409_when_already_running(self):
+        """A second post_all call while one is running should return 409."""
+        ConcurrentTaskLock.objects.create(
+            task_name="post_all",
+            locked_at=timezone.now(),
+        )
+        response = self.api_client.post("/api/news/post_all/", format="json")
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("error", response.json())
+
+    def test_proceeds_when_lock_is_stale(self):
+        """A stale lock should be overridden and the operation should proceed."""
+        ConcurrentTaskLock.objects.create(
+            task_name="post_all",
+            locked_at=timezone.now() - timezone.timedelta(seconds=1200),
+        )
+        response = self.api_client.post("/api/news/post_all/", format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
