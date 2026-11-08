@@ -13,7 +13,7 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='bufferaccount',
             name='api_url',
-            field=models.URLField(default='https://ubuntureport.onrender.com/api/news/top-sources-recent/', help_text='Upstream API URL to fetch news from for this account', max_length=500),
+            field=models.URLField(default='https://panafricanreport.onrender.com/api/news/top-sources-recent/', help_text='Upstream API URL to fetch news from for this account', max_length=500),
         ),
         migrations.AddField(
             model_name='bufferaccount',

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from django.utils import timezone
 from .models import News, NewsFilterRule
 
-DEFAULT_API_URL = "https://ubuntureport.onrender.com/api/news/top-sources-recent/"
+DEFAULT_API_URL = "https://panafricanreport.onrender.com/api/news/top-sources-recent/"
 
 
 class NewsFetcher:

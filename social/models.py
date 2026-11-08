@@ -142,7 +142,7 @@ class BufferAccount(models.Model):
     api_key = EncryptedTextField()
     api_url = models.URLField(
         max_length=500,
-        default='https://ubuntureport.onrender.com/api/news/top-sources-recent/',
+        default='https://panafricanreport.onrender.com/api/news/top-sources-recent/',
         help_text="Upstream API URL to fetch news from for this account"
     )
     token_expires_at = models.DateTimeField(blank=True, null=True)
