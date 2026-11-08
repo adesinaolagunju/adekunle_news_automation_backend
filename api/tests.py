@@ -1,6 +1,8 @@
 from unittest.mock import patch, MagicMock
 from datetime import timedelta
 
+from requests.exceptions import Timeout
+
 from django.test import TestCase
 from django.utils import timezone
 from django.contrib.auth import get_user_model
@@ -144,9 +146,10 @@ class FetchRecentEndpointTest(TestCase):
         self.addCleanup(patcher.stop)
 
         response = self.api_client.post("/api/news/fetch_recent/", format="json")
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
         data = response.json()
-        self.assertIn("accounts", data)
+        self.assertIn("error", data)
+        self.assertIn("errors", data)
         self.assertTrue(any("error" in a for a in data["accounts"]))
 
     def test_upstream_bad_json(self):
@@ -161,9 +164,42 @@ class FetchRecentEndpointTest(TestCase):
         self.addCleanup(patcher.stop)
 
         response = self.api_client.post("/api/news/fetch_recent/", format="json")
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
         data = response.json()
         self.assertTrue(any("error" in a for a in data["accounts"]))
+
+    def test_partial_failure_returns_200_with_errors(self):
+        """One working account plus one broken account is a partial success."""
+        broken_account = BufferAccount.objects.create(
+            user=self.user,
+            name="Broken Account",
+            api_key="broken-key",
+            api_url="https://dead.example.com/api/news/",
+            connection_status="connected",
+        )
+
+        def fetcher_factory(api_url=None):
+            fetcher = MagicMock()
+            fetcher.api_url = api_url
+            if api_url == broken_account.api_url:
+                fetcher.session.get.side_effect = Timeout("Connection timed out")
+            else:
+                fetcher.session.get.side_effect = self._mock_session_get(
+                    [([self._make_api_item(501)], False)]
+                )
+            return fetcher
+
+        patcher = patch("api.views.NewsFetcher", side_effect=fetcher_factory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        response = self.api_client.post("/api/news/fetch_recent/", format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(data["successful_accounts"], 1)
+        self.assertEqual(len(data["errors"]), 1)
+        self.assertEqual(data["new"], 1)
+        self.assertGreater(data["queued"], 0)
 
     def test_max_pages_hard_cap(self):
         pages = [([self._make_api_item(400 + i)], True) for i in range(11)]

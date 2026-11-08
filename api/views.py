@@ -656,15 +656,38 @@ class NewsViewSet(viewsets.ModelViewSet):
             total_pages += acct_pages
             accounts_processed += 1
 
-        return Response({
+        errors = [a for a in account_results if a.get('error')]
+        successful_accounts = accounts_processed - len(errors)
+
+        payload = {
             "accounts_processed": accounts_processed,
+            "successful_accounts": successful_accounts,
             "fetched": total_fetched,
             "new": total_new,
             "duplicates": total_duplicates,
             "queued": total_queued,
             "pages_fetched": total_pages,
             "accounts": account_results,
-        })
+            "errors": errors,
+        }
+
+        # If every account failed, this is not a successful "no news" result.
+        # Return a 5xx so the client surfaces the upstream problem instead of
+        # showing a misleading "No recent news found" success message.
+        if errors and successful_accounts == 0:
+            detail = errors[0].get("error", "unknown upstream error")
+            return Response(
+                {
+                    "error": (
+                        "All connected accounts failed to fetch news from the "
+                        f"upstream API: {detail}"
+                    ),
+                    **payload,
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(payload)
 
     
     import concurrent.futures
